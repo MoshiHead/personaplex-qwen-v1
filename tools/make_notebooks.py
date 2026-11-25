@@ -35,13 +35,39 @@ def notebook(cells: list[dict]) -> dict:
 # Data pipeline notebook
 # ===========================================================================
 
+# Shared by both notebooks: clone/pull the two repos under names that match
+# the config-cell defaults (/workspace/personaplex-qwen, /workspace/personaplex).
+CLONE_CELL = code("""
+# Clone or update the repos (first run downloads them; later runs git-pull).
+# If the PPQ repo is private, use a token in the URL:
+#   https://<TOKEN>@github.com/MoshiHead/personaplex-qwen-v1.git
+import subprocess
+from pathlib import Path
+
+def clone_or_pull(url: str, dest: Path):
+    if (dest / ".git").exists():
+        print("already cloned:", dest, "- pulling latest")
+        subprocess.run(["git", "-C", str(dest), "pull", "--ff-only"], check=False)
+    else:
+        subprocess.run(["git", "clone", url, str(dest)], check=True)
+    print(dest, "->", subprocess.run(["git", "-C", str(dest), "rev-parse", "--short", "HEAD"],
+                                     capture_output=True, text=True).stdout.strip())
+
+# NOTE: the clone only has what you PUSHED to GitHub - commit/push local
+# changes first or the box will run stale code.
+clone_or_pull("https://github.com/MoshiHead/personaplex-qwen-v1.git",
+              Path("/workspace/personaplex-qwen"))
+clone_or_pull("https://github.com/NVIDIA/personaplex.git",
+              Path("/workspace/personaplex"))
+""")
+
 DATA_CELLS = []
 
 DATA_CELLS.append(md("""
 # PPQ Data Pipeline
 
-Run this notebook on the DGX (8x H100/A100). It:
-1. Sets up paths and dependencies (kokoro TTS, vLLM in its own venv).
+Run this notebook on your GPU box (defaults: 2x 32 GB cards). It:
+1. Clones/updates the repos, sets up paths and dependencies (kokoro TTS, vLLM in its own venv).
 2. Generates dialogue scripts with an instruct LLM (vLLM), then **stops the server**.
 3. Launches one data worker per GPU for TTS + stereo stitching + Mimi tokenization.
 4. Prepares Stage-A monologue data from LibriTTS-R (CC-BY-4.0).
@@ -59,6 +85,8 @@ Run this notebook on the DGX (8x H100/A100). It:
 
 For a **fresh start**, set `RESUME = False` and `FRESH_START_CONFIRM = "FRESH"`.
 """))
+
+DATA_CELLS.append(CLONE_CELL)
 
 DATA_CELLS.append(code("""
 import os, sys, json, subprocess, time
@@ -81,10 +109,36 @@ RESUME = True                # False = archive previous outputs and start over
 FRESH_START_CONFIRM = ""     # type "FRESH" here when RESUME = False
 # --------------------
 
+# Locate the repos (folder names may differ from the defaults, e.g. a GitHub
+# clone named personaplex-qwen-v1). Fails loudly HERE, not at a later import.
+def _locate_repo(preferred: str, marker: str, fallbacks=()) -> str:
+    cands = [preferred, *fallbacks]
+    for c in cands:
+        if (Path(c) / marker).exists():
+            return str(Path(c).resolve())
+    raise FileNotFoundError(
+        f"repo not found: none of {cands} contains {marker}. "
+        "Set the correct path in the config cell above.")
+
+PPQ_REPO = _locate_repo(PPQ_REPO, "ppq/__init__.py", [
+    "/workspace/personaplex-qwen-v1",
+    str(Path.home() / "personaplex-qwen"),
+    str(Path.home() / "personaplex-qwen-v1"),
+])
+MOSHI_REPO = _locate_repo(MOSHI_REPO, "moshi/moshi/__init__.py", [
+    "/workspace/personaplex-v1",
+    str(Path.home() / "personaplex"),
+])
+
 os.environ["PYTHONPATH"] = f"{MOSHI_REPO}/moshi:{PPQ_REPO}:" + os.environ.get("PYTHONPATH", "")
 for p in (f"{MOSHI_REPO}/moshi", PPQ_REPO):
     if p not in sys.path:
         sys.path.insert(0, p)
+
+import importlib
+importlib.invalidate_caches()
+import ppq  # sanity check - if this fails, PPQ_REPO is still wrong
+print("ppq", ppq.__version__, "from", ppq.__file__)
 
 TOKENS_DIR = DATA_ROOT / "tokens"
 SCRIPTS = DATA_ROOT / "scripts.jsonl"
@@ -206,6 +260,10 @@ elif port_open(8000):
     print("vLLM server already running")
 else:
     model = resolve_model(GEN_MODEL)
+    # Kill zombie vLLM processes from previous crashed attempts - they hold
+    # GPU memory and make the fresh server fail at engine init.
+    subprocess.run(["pkill", "-f", "vllm.entrypoints"], check=False)
+    time.sleep(3)
     # Last GPU; with a single GPU it shares GPU 0 - fine, nothing else runs
     # during script generation (the server is stopped before the audio workers).
     vllm_gpu = N_GPUS - 1
@@ -224,10 +282,18 @@ else:
     for _ in range(360):   # up to 30 min (first run may download the model)
         if port_open(8000):
             break
-        if proc.poll() is not None:   # server died - fail fast with the log tail
-            tail = "".join((LOG_DIR / "vllm-server.log")
-                           .read_text(errors="replace").splitlines(keepends=True)[-30:])
-            raise RuntimeError(f"vLLM exited during startup. Log tail:\\n{tail}")
+        if proc.poll() is not None:   # server died - fail fast with the root cause
+            lines = (LOG_DIR / "vllm-server.log").read_text(
+                errors="replace").splitlines(keepends=True)
+            # the real error is in the EngineCore subprocess, which logs BEFORE
+            # the long APIServer wrapper traceback - center the window on it
+            err = max((i for i, l in enumerate(lines) if "ERROR" in l),
+                      default=max(0, len(lines) - 120))
+            lo = max(0, min(err - 5, len(lines) - 120))
+            tail = "".join(lines[lo:lo + 120])
+            raise RuntimeError(
+                "vLLM exited during startup. Log excerpt "
+                "(also run nvidia-smi to check for zombie GPU memory):\\n" + tail)
         time.sleep(5)
     assert port_open(8000), "vLLM did not start; see logs/vllm-server.log"
     print("vLLM server up")
@@ -476,6 +542,8 @@ To restart a stage from scratch, delete its `checkpoints/` directory.
 > restored exactly.
 """))
 
+TRAIN_CELLS.append(CLONE_CELL)
+
 TRAIN_CELLS.append(code("""
 import os, sys, json, subprocess
 from pathlib import Path
@@ -489,15 +557,41 @@ PERSONAPLEX_CKPT = "/workspace/models/personaplex/model.sft"  # personaplex LM (
 DATA_ROOT = Path("/workspace/ppq_data")
 TOKENS_DIR = DATA_ROOT / "tokens"
 RUN_DIR = Path("/workspace/ppq_runs/run1")
-CLIENT_DIST = Path(MOSHI_REPO) / "client" / "dist"
 N_GPUS = 2                   # works with 1; increase on bigger boxes
 # --------------------
+
+# Locate the repos (folder names may differ from the defaults, e.g. a GitHub
+# clone named personaplex-qwen-v1). Fails loudly HERE, not at a later import.
+def _locate_repo(preferred: str, marker: str, fallbacks=()) -> str:
+    cands = [preferred, *fallbacks]
+    for c in cands:
+        if (Path(c) / marker).exists():
+            return str(Path(c).resolve())
+    raise FileNotFoundError(
+        f"repo not found: none of {cands} contains {marker}. "
+        "Set the correct path in the config cell above.")
+
+PPQ_REPO = _locate_repo(PPQ_REPO, "ppq/__init__.py", [
+    "/workspace/personaplex-qwen-v1",
+    str(Path.home() / "personaplex-qwen"),
+    str(Path.home() / "personaplex-qwen-v1"),
+])
+MOSHI_REPO = _locate_repo(MOSHI_REPO, "moshi/moshi/__init__.py", [
+    "/workspace/personaplex-v1",
+    str(Path.home() / "personaplex"),
+])
 
 os.environ["PYTHONPATH"] = f"{MOSHI_REPO}/moshi:{PPQ_REPO}:" + os.environ.get("PYTHONPATH", "")
 for p in (f"{MOSHI_REPO}/moshi", PPQ_REPO):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+import importlib
+importlib.invalidate_caches()
+import ppq  # sanity check - if this fails, PPQ_REPO is still wrong
+print("ppq", ppq.__version__, "from", ppq.__file__)
+
+CLIENT_DIST = Path(MOSHI_REPO) / "client" / "dist"
 STAGE_A_DIR = RUN_DIR / "stage_a"
 STAGE_B_DIR = RUN_DIR / "stage_b"
 RUN_DIR.mkdir(parents=True, exist_ok=True)
