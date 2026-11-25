@@ -26,7 +26,8 @@ ppq/            model, lmgen, tokenizer, checkpoint, transplant
 ppq/data/       script gen, Kokoro TTS, stereo stitch, mimi tokenize, dataset
 ppq/train/      loss, train loop (DDP / FSDP2), evaluation
 ppq/serve/      WebSocket server (stock PersonaPlex protocol) + offline CLI
-tests/          equivalence + streaming + data + transplant + training-step tests
+ppq/progress.py progress tracking, ETA, append-mode logging, PID locks, JSONL repair
+tests/          equivalence + streaming + data + transplant + training-step + resume tests
 notebooks/      ppq_data_pipeline.ipynb, ppq_training.ipynb
 ```
 
@@ -49,10 +50,32 @@ export PYTHONPATH=/workspace/personaplex/moshi:/workspace/personaplex-qwen:$PYTH
    --voice-prompt-dir voices/ --default-voice af_heart.wav --static client/dist`
    and open the stock PersonaPlex web UI.
 
+## Progress, logging and crash-safe resume
+
+Both notebooks are built for long, interruptible runs:
+
+- **Data pipeline**: the manifest is the source of truth. Samples are named by
+  stable global indices (`conv-0000123.npz`), written atomically (temp file +
+  rename), and each dialogue's stitch RNG is seeded by its index, so resuming
+  after a crash reproduces byte-identical audio. Torn manifests/JSONL are
+  repaired automatically; failing dialogues are retried up to `--max-attempts`
+  (tracked in `logs/failed-*.jsonl`, re-arm with `--retry-failed`). Per-shard
+  logs and `progress-*.json` files (done/total/%/ETA) live in
+  `DATA_ROOT/logs/`; notebook *watch* cells render a live table, and stale
+  workers are flagged as `STALLED?`.
+- **Training**: each stage writes to its own directory. Checkpoints are atomic
+  (`COMPLETE` markers) and bundle model + optimizer + scheduler + RNG states;
+  a `LAST` pointer drives auto-resume (on by default), `keep_last_k` prunes
+  old checkpoints, and `save_every_minutes` bounds lost work. A finished stage
+  (`checkpoints/final`) exits immediately when relaunched. Launch with
+  `torchrun --max-restarts 3` so node hiccups self-heal. After a resume the
+  data order is reshuffled (reseeded), so resumed runs are equivalent rather
+  than bit-identical.
+
 ## Tests
 
 ```bash
-pytest tests/              # 15 tests, CPU-friendly
+pytest tests/              # 29 tests, CPU-friendly
 ```
 
 Tests without GPU/HF deps cover: Qwen backbone construction vs HF config,

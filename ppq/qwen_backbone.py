@@ -49,6 +49,11 @@ class Qwen3RotaryEmbedding(nn.Module):
     def __init__(self, cfg: QwenBackboneConfig, device=None):
         super().__init__()
         self.head_dim = cfg.head_dim
+        self._cfg = cfg  # kept so the tables can be rebuilt (e.g. after meta init)
+        self.build_tables(device)
+
+    def build_tables(self, device=None) -> None:
+        cfg = self._cfg
         inv_freq = 1.0 / (
             cfg.rope_theta
             ** (torch.arange(0, cfg.head_dim, 2, dtype=torch.float32, device=device) / cfg.head_dim)

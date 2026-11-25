@@ -166,9 +166,17 @@ class TrainConfig:
     fsdp: bool = False
     gradient_checkpointing: bool = True
     seed: int = 1234
+    num_workers: int = 4
+    shuffle: bool = True              # shuffle sample order (disable for exact-repeat tests)
     log_every: int = 10
     save_every: int = 250
-    resume: str = ""               # path to run dir to resume from
+    save_every_minutes: float = 30.0  # time-based saves: a crash loses at most this much work
+    keep_last_k: int = 3              # step checkpoints to keep (disk usage)
+    # Resume / initialization
+    init_checkpoint: str = ""         # fresh start dir; empty -> <output_dir>/init
+    auto_resume: bool = True          # resume from checkpoints/LAST when available
+    # Debug/testing: crash after N steps (after saving, if a save was due)
+    debug_stop_after_steps: int = 0
 
     def to_json(self, path: str | Path):
         with open(path, "w", encoding="utf-8") as f:
@@ -176,9 +184,13 @@ class TrainConfig:
 
     @classmethod
     def from_json(cls, path: str | Path) -> "TrainConfig":
+        import dataclasses
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         m = data["model"]
         m["qwen"] = QwenBackboneConfig(**m["qwen"])
         data["model"] = PPQModelConfig(**m)
+        # tolerate configs written by other versions (unknown keys are ignored)
+        known = {f.name for f in dataclasses.fields(cls)}
+        data = {k: v for k, v in data.items() if k in known}
         return cls(**data)

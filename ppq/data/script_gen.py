@@ -105,13 +105,21 @@ def generate_scripts_openai(n: int, out_path: str | Path, model: str,
                             base_url: str = "http://127.0.0.1:8000/v1",
                             temperature: float = 0.9, seed: int = 0,
                             max_tokens: int = 4096) -> int:
-    """Generate n dialogues via an OpenAI-compatible server (vLLM)."""
+    """Generate n dialogues via an OpenAI-compatible server (vLLM).
+    Appends to out_path; resuming continues from the existing line count."""
+    import time
     from openai import OpenAI
+    from ..progress import repair_jsonl, fmt_duration
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    repair_jsonl(out_path)
     client = OpenAI(base_url=base_url, api_key="EMPTY")
-    rng = random.Random(seed + _count_lines(out_path))
+    existing = _count_lines(out_path)
+    rng = random.Random(seed + existing)
     done = 0
+    t0 = time.time()
+    logger.info("script generation: %d already exist, generating %d more (target %d)",
+                existing, n, existing + n)
     with open(out_path, "a", encoding="utf-8") as fout:
         while done < n:
             messages = build_generation_messages(rng)
@@ -129,8 +137,12 @@ def generate_scripts_openai(n: int, out_path: str | Path, model: str,
             fout.write(dlg.to_json() + "\n")
             fout.flush()
             done += 1
-            if done % 10 == 0:
-                logger.info("generated %d/%d dialogues", done, n)
+            if done % 10 == 0 or done == n:
+                rate = done / max(1e-9, time.time() - t0)
+                eta = fmt_duration((n - done) / rate if rate else None)
+                logger.info("scripts %d/%d total (%.1f%%) | +%d this session | "
+                            "%.2f scripts/s | ETA %s", existing + done, existing + n,
+                            100.0 * done / n, done, rate, eta)
     return done
 
 
@@ -138,15 +150,22 @@ def generate_scripts_hf(n: int, out_path: str | Path, model_id: str,
                         temperature: float = 0.9, seed: int = 0,
                         max_new_tokens: int = 3000) -> int:
     """Fallback: generate dialogues with a local transformers model."""
+    import time
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    from ..progress import repair_jsonl, fmt_duration
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    repair_jsonl(out_path)
     tok = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(
         model_id, torch_dtype=torch.bfloat16, device_map="cuda")
-    rng = random.Random(seed + _count_lines(out_path))
+    existing = _count_lines(out_path)
+    rng = random.Random(seed + existing)
     done = 0
+    t0 = time.time()
+    logger.info("script generation: %d already exist, generating %d more (target %d)",
+                existing, n, existing + n)
     with open(out_path, "a", encoding="utf-8") as fout:
         while done < n:
             messages = build_generation_messages(rng)
@@ -162,7 +181,11 @@ def generate_scripts_hf(n: int, out_path: str | Path, model_id: str,
             fout.write(dlg.to_json() + "\n")
             fout.flush()
             done += 1
-            if done % 5 == 0:
-                logger.info("generated %d/%d dialogues", done, n)
+            if done % 5 == 0 or done == n:
+                rate = done / max(1e-9, time.time() - t0)
+                eta = fmt_duration((n - done) / rate if rate else None)
+                logger.info("scripts %d/%d total (%.1f%%) | +%d this session | "
+                            "%.2f scripts/s | ETA %s", existing + done, existing + n,
+                            100.0 * done / n, done, rate, eta)
     return done
 
