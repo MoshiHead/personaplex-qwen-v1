@@ -69,9 +69,11 @@ PPQ_REPO = "/workspace/personaplex-qwen"            # this repo (contains ppq/)
 MOSHI_REPO = "/workspace/personaplex"              # original personaplex repo (moshi pkg inside)
 MIMI_WEIGHT = "/workspace/models/mimi.safetensors" # moshi mimi codec weights
 QWEN_TOKENIZER = "/workspace/models/qwen3-1.7b-base"  # local snapshot of Qwen/Qwen3-1.7B-Base
-GEN_MODEL = "/workspace/models/qwen3-8b"          # local snapshot of the script-generator model
+# Script-generator model: a local snapshot dir OR a HF repo id ("Qwen/Qwen3-8B",
+# auto-downloaded by vLLM). On a 32 GB card, "Qwen/Qwen3-4B" also works well.
+GEN_MODEL = "/workspace/models/qwen3-8b"
 DATA_ROOT = Path("/workspace/ppq_data")
-N_GPUS = 8
+N_GPUS = 2                   # how many GPUs this box has (works with 1)
 TARGET_SCRIPTS = 35000   # ~35k x ~80 s ~= 800 h of dialogue
 MAX_ATTEMPTS = 3         # per-dialogue retry limit before it is skipped for good
 
@@ -157,24 +159,51 @@ def port_open(port: int = 8000) -> bool:
     with socket.socket() as s:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
+def resolve_model(spec: str) -> str:
+    # Local snapshot dir if it exists, else a HF repo id (vLLM downloads it).
+    p = Path(spec)
+    if p.exists():
+        assert (p / "config.json").exists(), \
+            f"{p} has no config.json - not a model snapshot (incomplete download?)"
+        return str(p)
+    if not spec.startswith("/") and "/" in spec:
+        print(f"'{spec}' not found locally - vLLM will download it from Hugging Face")
+        return spec
+    raise FileNotFoundError(
+        f"model not found: {spec}\\n"
+        "Either download it first, e.g.:\\n"
+        f"  huggingface-cli download Qwen/Qwen3-8B --local-dir {spec}\\n"
+        "or set GEN_MODEL = 'Qwen/Qwen3-8B' in the config cell and vLLM will "
+        "download it automatically.")
+
 if _script_count() >= TARGET_SCRIPTS:
     print("scripts already complete:", _script_count())
 elif port_open(8000):
     print("vLLM server already running")
 else:
+    model = resolve_model(GEN_MODEL)
+    # Last GPU; with a single GPU it shares GPU 0 - fine, nothing else runs
+    # during script generation (the server is stopped before the audio workers).
+    vllm_gpu = N_GPUS - 1
     srv_log = open(LOG_DIR / "vllm-server.log", "ab", buffering=0)
     proc = subprocess.Popen([
         str(VENV / "bin/python"), "-m", "vllm.entrypoints.openai.api_server",
-        "--model", GEN_MODEL, "--served-model-name", "qwen-gen",
+        "--model", model, "--served-model-name", "qwen-gen",
         "--tensor-parallel-size", "1", "--max-model-len", "8192",
-        "--gpu-memory-utilization", "0.45", "--port", "8000",
+        # vLLM runs alone in this phase, so give it most of the card; 0.45 of a
+        # 32 GB card is too small for an 8B bf16 model (~16 GB of weights).
+        "--gpu-memory-utilization", "0.85", "--port", "8000",
     ], stdout=srv_log, stderr=subprocess.STDOUT, start_new_session=True,
-       env={**os.environ, "CUDA_VISIBLE_DEVICES": str(N_GPUS - 1)})
+       env={**os.environ, "CUDA_VISIBLE_DEVICES": str(vllm_gpu)})
     (LOG_DIR / "vllm-server.pid").write_text(str(proc.pid))
-    print("vLLM starting (pid", proc.pid, ") - waiting for readiness...")
-    for _ in range(240):
+    print("vLLM starting (pid", proc.pid, ") on GPU", vllm_gpu, "- waiting for readiness...")
+    for _ in range(360):   # up to 30 min (first run may download the model)
         if port_open(8000):
             break
+        if proc.poll() is not None:   # server died - fail fast with the log tail
+            tail = "".join((LOG_DIR / "vllm-server.log")
+                           .read_text(errors="replace").splitlines(keepends=True)[-30:])
+            raise RuntimeError(f"vLLM exited during startup. Log tail:\\n{tail}")
         time.sleep(5)
     assert port_open(8000), "vLLM did not start; see logs/vllm-server.log"
     print("vLLM server up")
@@ -398,7 +427,9 @@ TRAIN_CELLS = []
 TRAIN_CELLS.append(md("""
 # PPQ Training
 
-Run on the DGX (8x H100/A100) after `ppq_data_pipeline.ipynb`. Stages:
+Run after `ppq_data_pipeline.ipynb` on a multi-GPU box (defaults are tuned
+for 2x 32 GB cards, e.g. RTX 5090; scale `N_GPUS`/`batch_size` up on bigger
+hardware). Stages:
 1. Build the initial checkpoint: Qwen backbone weights + transplanted depformer.
 2. Stage A — audio-side warmup (backbone frozen).
 3. Stage B — full fine-tuning.
@@ -435,7 +466,7 @@ DATA_ROOT = Path("/workspace/ppq_data")
 TOKENS_DIR = DATA_ROOT / "tokens"
 RUN_DIR = Path("/workspace/ppq_runs/run1")
 CLIENT_DIST = Path(MOSHI_REPO) / "client" / "dist"
-N_GPUS = 8
+N_GPUS = 2                   # works with 1; increase on bigger boxes
 # --------------------
 
 os.environ["PYTHONPATH"] = f"{MOSHI_REPO}/moshi:{PPQ_REPO}:" + os.environ.get("PYTHONPATH", "")
@@ -492,8 +523,10 @@ tcfg_a = TrainConfig(
     output_dir=str(STAGE_A_DIR),
     init_checkpoint=str(RUN_DIR / "init"),
     stage="a_audio_warmup",
-    batch_size=4, grad_accum=1,
-    max_steps=400,               # ~= 400 x 32 x 100 s = 350 h of audio seen
+    # 32 GB cards: batch_size=2 per GPU. On 80 GB cards use batch_size=4,
+    # grad_accum=1. Effective batch = batch_size x grad_accum x N_GPUS.
+    batch_size=2, grad_accum=2,
+    max_steps=400,               # ~= 400 x (4 x N_GPUS) x 100 s of audio seen
     save_every=200, save_every_minutes=30, keep_last_k=3,
     log_every=10,
     fsdp=False,                  # DDP; resume of optimizer state needs fsdp=False
@@ -557,7 +590,8 @@ tcfg_b = TrainConfig(
     output_dir=str(STAGE_B_DIR),
     init_checkpoint=str(STAGE_A_DIR / "checkpoints" / "final"),
     stage="b_full",
-    batch_size=4, grad_accum=1,
+    # 32 GB cards: batch_size=2 + grad checkpointing. 80 GB cards: batch_size=4.
+    batch_size=2, grad_accum=2,
     max_steps=1000,
     lr=5e-6, backbone_lr_mult=0.5, depformer_lr_mult=1.5,
     lora_rank=64,
