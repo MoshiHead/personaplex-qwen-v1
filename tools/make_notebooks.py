@@ -131,10 +131,36 @@ print("kokoro ok:", kokoro.__file__)
 
 DATA_CELLS.append(code("""
 VENV = Path("/workspace/venvs/vllm_gen")
+# Pin vllm: 0.10.2 is the last release whose bundled torch is built for CUDA
+# 12.8 drivers. Newer vllm wheels need a CUDA 12.9+ driver (torch aborts with
+# "NVIDIA driver too old"). If you update the NVIDIA driver to 575+, unpin.
+VLLM_SPEC = "vllm==0.10.2"
 if not (VENV / "bin" / "python").exists():
     subprocess.run(["python3", "-m", "venv", str(VENV)], check=True)
-    subprocess.run([str(VENV / "bin/pip"), "install", "-q", "vllm", "openai"], check=True)
-print("vllm venv:", VENV)
+    subprocess.run([str(VENV / "bin/pip"), "install", "-q", VLLM_SPEC, "openai"], check=True)
+else:   # venv exists - make sure the pinned version is what's installed
+    cur = subprocess.run([str(VENV / "bin/python"), "-c",
+                          "import vllm; print(vllm.__version__)"],
+                         capture_output=True, text=True)
+    want = VLLM_SPEC.split("==")[1]
+    if cur.returncode != 0 or cur.stdout.strip() != want:
+        print("installed vllm:", cur.stdout.strip() or "<none>",
+              "-> reinstalling", VLLM_SPEC)
+        subprocess.run([str(VENV / "bin/pip"), "install", "-q", "--force-reinstall",
+                        VLLM_SPEC, "openai"], check=True)
+print("vllm venv:", VENV, VLLM_SPEC)
+"""))
+
+DATA_CELLS.append(code("""
+# Download the script-generator model (first run only).
+# Skipped automatically when GEN_MODEL already exists locally or is a HF repo id.
+if GEN_MODEL.startswith("/") and not Path(GEN_MODEL).exists():
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U",
+                    "huggingface_hub"], check=True)
+    from huggingface_hub import snapshot_download
+    # if you point GEN_MODEL at a different model, change the repo_id here too
+    snapshot_download(repo_id="Qwen/Qwen3-8B", local_dir=GEN_MODEL)
+print("gen model ready:", GEN_MODEL)
 """))
 
 DATA_CELLS.append(md("""
