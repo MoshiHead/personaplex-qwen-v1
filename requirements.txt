@@ -1,0 +1,24 @@
+# Core runtime (matches the original personaplex moshi environment)
+torch>=2.5
+transformers>=4.51,<5.0
+safetensors
+numpy
+einops
+sphn
+sentencepiece
+huggingface_hub
+soundfile
+aiohttp
+
+# Data pipeline
+kokoro>=0.9        # Apache-2.0 TTS (install from source recommended)
+misaki[en]         # G2P for kokoro
+pyloudnorm         # loudness normalization (LibriTTS-R stage)
+datasets           # HF streaming datasets (LibriTTS-R)
+openai             # script generation via a vLLM OpenAI-compatible server
+
+# Training
+peft               # optional LoRA config
+
+# Tests
+pytest

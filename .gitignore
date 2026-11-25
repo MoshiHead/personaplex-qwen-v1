@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+*.safetensors
+*.sft
+*.pt
+*.wav
+*.opus
+*.npz
+ppq_data/
+ppq_runs/
+models/
+venvs/
