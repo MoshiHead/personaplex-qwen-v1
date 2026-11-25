@@ -131,24 +131,22 @@ print("kokoro ok:", kokoro.__file__)
 
 DATA_CELLS.append(code("""
 VENV = Path("/workspace/venvs/vllm_gen")
-# Pin vllm: 0.10.2 is the last release whose bundled torch is built for CUDA
-# 12.8 drivers. Newer vllm wheels need a CUDA 12.9+ driver (torch aborts with
-# "NVIDIA driver too old"). If you update the NVIDIA driver to 575+, unpin.
-VLLM_SPEC = "vllm==0.10.2"
+# vllm 0.10.2 is the last release whose bundled torch targets CUDA 12.8
+# drivers (newer wheels abort with "NVIDIA driver too old" on cu128 drivers).
+# transformers must stay at 4.56.x: newer releases removed
+# PreTrainedTokenizer.all_special_tokens_extended, which vllm 0.10.2 calls.
+# If you update the NVIDIA driver to 575+ (CUDA 12.9), you can unpin both.
+VENV_PKGS = ["vllm==0.10.2", "transformers==4.56.2", "openai"]
+_MARKER = VENV / ".ppq-pinned"
+_WANT = ",".join(VENV_PKGS)
 if not (VENV / "bin" / "python").exists():
     subprocess.run(["python3", "-m", "venv", str(VENV)], check=True)
-    subprocess.run([str(VENV / "bin/pip"), "install", "-q", VLLM_SPEC, "openai"], check=True)
-else:   # venv exists - make sure the pinned version is what's installed
-    cur = subprocess.run([str(VENV / "bin/python"), "-c",
-                          "import vllm; print(vllm.__version__)"],
-                         capture_output=True, text=True)
-    want = VLLM_SPEC.split("==")[1]
-    if cur.returncode != 0 or cur.stdout.strip() != want:
-        print("installed vllm:", cur.stdout.strip() or "<none>",
-              "-> reinstalling", VLLM_SPEC)
-        subprocess.run([str(VENV / "bin/pip"), "install", "-q", "--force-reinstall",
-                        VLLM_SPEC, "openai"], check=True)
-print("vllm venv:", VENV, VLLM_SPEC)
+if not _MARKER.exists() or _MARKER.read_text().strip() != _WANT:
+    print("installing pinned packages into the venv (a few minutes)...")
+    subprocess.run([str(VENV / "bin/pip"), "install", "-q", "--force-reinstall",
+                    *VENV_PKGS], check=True)
+    _MARKER.write_text(_WANT)
+print("vllm venv:", VENV, VENV_PKGS)
 """))
 
 DATA_CELLS.append(code("""
