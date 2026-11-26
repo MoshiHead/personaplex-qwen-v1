@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from ..config import PPQModelConfig, TrainConfig
 from ..model import LMOutput
@@ -26,9 +27,18 @@ def compute_losses(lm_out: LMOutput, codes: torch.Tensor, loss_mask: torch.Tenso
                     torch.tensor(tcfg.text_padding_weight, device=device),
                     torch.tensor(1.0, device=device))
     B, T, V = text_logits.shape
-    ce = F.cross_entropy(
-        text_logits.reshape(B * T, V).float(), text_target.reshape(B * T),
-        reduction="none").reshape(B, T)
+    # Chunked + checkpointed CE: the full-vocab fp32 upcast for 1250 frames is
+    # a ~760 MB spike at once; chunking bounds it and checkpointing recomputes
+    # each chunk during backward instead of retaining it. Row-wise CE is exact.
+    flat_logits = text_logits.reshape(B * T, V)
+    flat_target = text_target.reshape(B * T)
+    ce_chunks = []
+    for t0 in range(0, B * T, 256):
+        ce_chunks.append(torch.utils.checkpoint.checkpoint(
+            lambda a, b: F.cross_entropy(a.float(), b, reduction="none"),
+            flat_logits[t0:t0 + 256], flat_target[t0:t0 + 256],
+            use_reentrant=False))
+    ce = torch.cat(ce_chunks).reshape(B, T)
     denom = (w * text_sel).sum().clamp(min=1.0)
     losses["text"] = (ce * w * text_sel).sum() / denom
 
