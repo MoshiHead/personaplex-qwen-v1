@@ -572,7 +572,7 @@ QWEN_BASE = "/workspace/models/qwen3-1.7b-base"        # local Qwen3-1.7B-Base s
 PERSONAPLEX_CKPT = "/workspace/models/personaplex/model.sft"  # personaplex LM (depformer donor)
 DATA_ROOT = Path("/workspace/ppq_data")
 TOKENS_DIR = DATA_ROOT / "tokens"
-RUN_DIR = Path("/workspace/ppq_runs/run1")
+RUN_DIR = Path("/workspace/ppq_runs/run2")  # run1 = video-21h trial; fresh dir = clean LR schedule
 N_GPUS = 2                   # training ranks; auto-clamped to the physical GPU count
 # --------------------
 
@@ -714,7 +714,7 @@ tcfg_a = TrainConfig(
     # use batch_size=4, grad_accum=1. Effective batch = batch x accum x N_GPUS.
     # Still OOM? Lower segment_frames (e.g. 750 = 60 s) - crops are random.
     batch_size=1, grad_accum=4,
-    max_steps=400,               # ~= 400 x (4 x N_GPUS) x 100 s of audio seen
+    max_steps=2000,              # ~= 2000 x (4 x N_GPUS) x 100 s of audio seen
     save_every=200, save_every_minutes=30, keep_last_k=3,
     log_every=10,
     fsdp=False,                  # DDP; resume of optimizer state needs fsdp=False
@@ -783,7 +783,9 @@ tcfg_b = TrainConfig(
     # 32 GB cards: batch_size=1 + grad checkpointing. 80 GB cards: batch_size=4,
     # grad_accum=1. Still OOM? Lower segment_frames (e.g. 750 = 60 s).
     batch_size=1, grad_accum=4,
-    max_steps=1000,
+    max_steps=10000,             # ~5-7 epochs over the full 4-source dataset.
+                                 # Set BEFORE launch - the cosine LR schedule is
+                                 # derived from max_steps, changing it mid-run rescales LR.
     lr=5e-6, backbone_lr_mult=0.5, depformer_lr_mult=1.5,
     lora_rank=64,
     save_every=250, save_every_minutes=30, keep_last_k=3,
@@ -821,7 +823,8 @@ assert is_complete(FINAL_B), "finish Stage B first"
 
 device = "cuda"
 model = load_pretrained(FINAL_B, device=device)
-manifests = sorted(glob.glob(str(TOKENS_DIR / "manifest*.jsonl")))[:1]
+manifests = sorted(glob.glob(str(TOKENS_DIR / "manifest*.jsonl")))  # all sources + shards
+print(f"eval manifests: {len(manifests)}")
 ds = TokenShardDataset(manifests, model.cfg, segment_frames=1250, seed=999)
 loader = torch.utils.data.DataLoader(ds, batch_size=4, collate_fn=collate, drop_last=True)
 losses = eval_per_codebook(model, loader, n_batches=8, device=device, mcfg=model.cfg)
