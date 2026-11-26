@@ -36,7 +36,7 @@ def _write_tokens(data_dir: Path, cfg, n: int = 2, T: int = 60) -> None:
 
 
 def _config(tmp_path: Path, cfg, out_name: str, max_steps: int,
-            crash_after: int = 0) -> Path:
+            crash_after: int = 0, lora_rank: int = 0) -> Path:
     tcfg = TrainConfig(
         model=cfg,
         data_dir=str(tmp_path / "tokens"),
@@ -50,6 +50,7 @@ def _config(tmp_path: Path, cfg, out_name: str, max_steps: int,
         save_every_minutes=0.0,
         shuffle=False,  # deterministic sample order for the bit-exact comparison
         debug_stop_after_steps=crash_after,
+        lora_rank=lora_rank,
     )
     path = tmp_path / f"{out_name}.json"
     tcfg.to_json(path)
@@ -101,3 +102,45 @@ def test_finished_stage_exits_immediately(tmp_path):
     time.sleep(0.05)
     train.main(str(cfg_path))  # should exit without retraining
     assert final.stat().st_mtime == mtime
+
+
+def test_lora_grouping_and_merged_final(tmp_path):
+    """LoRA stage B: peft-prefixed param names must still land in the right
+    optimizer LR groups, resume via the overlay path must work, and the final
+    checkpoint must be merged (loadable into a plain PPQLMModel)."""
+    pytest.importorskip("peft")
+    from ppq.checkpoint import load_pretrained
+    from ppq.train.train import make_optimizer, maybe_apply_lora
+
+    model = tiny_model()
+    save_pretrained(model, tmp_path / "init")
+    _write_tokens(tmp_path / "tokens", model.cfg)
+
+    # --- optimizer grouping with peft's "base_model.model." name prefix ---
+    tcfg = TrainConfig(model=model.cfg, lora_rank=8, lr=1e-4,
+                       backbone_lr_mult=0.5, depformer_lr_mult=1.5)
+    lora_model = maybe_apply_lora(tiny_model(), tcfg)
+    opt = make_optimizer(lora_model, tcfg)
+    g_backbone, g_dep, _ = opt.param_groups
+    assert g_backbone["lr"] == pytest.approx(1e-4 * 0.5)
+    assert g_dep["lr"] == pytest.approx(1e-4 * 1.5)
+    lora_params = [p for n, p in lora_model.named_parameters() if "lora_" in n]
+    assert lora_params, "peft did not add any LoRA params"
+    assert all(any(p is q for q in g_backbone["params"]) for p in lora_params)
+    dep_trainable = [p for n, p in lora_model.named_parameters()
+                     if p.requires_grad and ".depformer" in n and "lora_" not in n]
+    assert dep_trainable
+    assert all(any(p is q for q in g_dep["params"]) for p in dep_trainable)
+
+    # --- crash + resume through the LoRA overlay path, then merged final ---
+    with pytest.raises(RuntimeError, match="debug_stop_after_steps"):
+        train.main(str(_config(tmp_path, model.cfg, "run_lora", max_steps=2,
+                               crash_after=1, lora_rank=8)))
+    train.main(str(_config(tmp_path, model.cfg, "run_lora", max_steps=2,
+                           lora_rank=8)))
+
+    final_dir = tmp_path / "run_lora" / "checkpoints" / "final"
+    state = load_file(str(final_dir / "model.safetensors"))
+    assert not any(k.startswith("base_model.model.") or "lora_" in k for k in state)
+    merged = load_pretrained(final_dir, device="cpu")  # strict load, plain model
+    assert type(merged) is type(model)

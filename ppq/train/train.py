@@ -83,18 +83,26 @@ def maybe_apply_lora(model, tcfg: TrainConfig):
                         "gate_proj", "up_proj", "down_proj"],
     )
     model = get_peft_model(model, lcfg)
+    # peft freezes ALL base weights, but stage B fine-tunes everything outside
+    # the LoRA-adapted backbone fully (depformer, embeddings, heads, linears).
+    backbone_prefix = "base_model.model.backbone."
+    for name, p in model.named_parameters():
+        if "lora_" not in name and not name.startswith(backbone_prefix):
+            p.requires_grad = True
     model.print_trainable_parameters()
     return model
 
 
 def make_optimizer(model, tcfg: TrainConfig):
     groups = {"backbone": [], "depformer": [], "other": []}
+    peft_prefix = "base_model.model."  # peft wraps every param name with this
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if name.startswith(("backbone.", "text_emb.", "text_linear.")):
+        gname = name[len(peft_prefix):] if name.startswith(peft_prefix) else name
+        if gname.startswith(("backbone.", "text_emb.", "text_linear.")):
             groups["backbone"].append(p)
-        elif name.startswith(("depformer", "linears.")):
+        elif gname.startswith(("depformer", "linears.")):
             groups["depformer"].append(p)
         else:
             groups["other"].append(p)
@@ -388,7 +396,12 @@ def main(config_path: str | None = None):
             raise RuntimeError("debug_stop_after_steps crash simulation")
 
     if rank == 0:
-        save_pretrained(raw_model, out_dir / "checkpoints" / "final")
+        final_model = raw_model
+        if hasattr(final_model, "merge_and_unload"):
+            # LoRA run: bake the adapters into the base weights so the final
+            # checkpoint loads into a plain PPQLMModel (eval/serving).
+            final_model = final_model.merge_and_unload()
+        save_pretrained(final_model, out_dir / "checkpoints" / "final")
         sec_per_step = (sum(step_times) / len(step_times)) if step_times else 0.0
         write_progress(out_dir, tcfg, tcfg.max_steps, "finished", last_losses,
                        scheduler.get_last_lr()[0], sec_per_step,

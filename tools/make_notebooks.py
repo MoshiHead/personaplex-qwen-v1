@@ -555,7 +555,7 @@ TRAIN_CELLS.append(CLONE_CELL)
 TRAIN_CELLS.append(code("""
 import subprocess, sys
 subprocess.run([sys.executable, "-m", "pip", "install", "-q",
-    "huggingface_hub", "safetensors", "einops", "sphn"], check=True)
+    "huggingface_hub", "safetensors", "einops", "sphn", "peft"], check=True)
 print("deps ok")
 """))
 
