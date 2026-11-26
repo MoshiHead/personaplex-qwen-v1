@@ -565,8 +565,16 @@ PERSONAPLEX_CKPT = "/workspace/models/personaplex/model.sft"  # personaplex LM (
 DATA_ROOT = Path("/workspace/ppq_data")
 TOKENS_DIR = DATA_ROOT / "tokens"
 RUN_DIR = Path("/workspace/ppq_runs/run1")
-N_GPUS = 2                   # works with 1; increase on bigger boxes
+N_GPUS = 2                   # training ranks; auto-clamped to the physical GPU count
 # --------------------
+
+import torch
+N_PHYSICAL_GPUS = max(1, torch.cuda.device_count())  # auto-detected
+if N_GPUS > N_PHYSICAL_GPUS:
+    # DDP ranks pin local_rank -> cuda:local_rank, so ranks cannot share a GPU.
+    print(f"note: N_GPUS={N_GPUS} clamped to {N_PHYSICAL_GPUS} physical GPU(s)")
+    N_GPUS = N_PHYSICAL_GPUS
+print(f"physical GPUs: {N_PHYSICAL_GPUS} | training ranks: {N_GPUS}")
 
 # Locate the repos (folder names may differ from the defaults, e.g. a GitHub
 # clone named personaplex-qwen-v1). Fails loudly HERE, not at a later import.

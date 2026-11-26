@@ -47,6 +47,11 @@ def setup_distributed() -> tuple[int, int, int, bool]:
         rank = int(os.environ["RANK"])
         world = int(os.environ["WORLD_SIZE"])
         local = int(os.environ["LOCAL_RANK"])
+        # More ranks than physical GPUs is fine (ranks share GPUs); only the
+        # device ordinal must stay in range. Return the device ordinal as
+        # local_rank so downstream device placement uses it too.
+        n_dev = max(1, torch.cuda.device_count())
+        local = local % n_dev
         torch.cuda.set_device(local)
         torch.distributed.init_process_group(backend="nccl")
         return rank, world, local, world > 1
