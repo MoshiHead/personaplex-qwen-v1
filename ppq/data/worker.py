@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import random
+import time
 import traceback
 from pathlib import Path
 
@@ -379,40 +380,70 @@ def _run_asr_locked(args, log_dir: Path):
         return
 
     engine = asr_mod.WhisperASR(args.asr_model, args.device)
+    log.info("ASR engine device: %s", getattr(engine.pipe, "device", "?"))
     store = TarStore(spec, data_root, token)
     smap = store.session_map()
     log.info("shard %d/%d: %d sessions to transcribe", args.shard, args.num_shards, len(owned))
 
+    def _cache(sid: str, ch: int) -> Path:
+        return asr_mod.cache_path(data_root, spec.name, sid, ch)
+
+    def _cached(sid: str) -> bool:
+        return all(asr_mod.load_cached(_cache(sid, ch)) is not None for ch in (0, 1))
+
+    def _cached_duration(sid: str) -> float:
+        ends = [float(r[1]) for ch in (0, 1)
+                for r in (asr_mod.load_cached(_cache(sid, ch)) or {}).get("regions", [])]
+        return max(ends, default=0.0)
+
+    # count sessions already cached by earlier runs so progress reflects reality
     for sid in owned:
-        if not args.retry_failed and failed.get(sid, 0) >= args.max_attempts:
-            continue
-        try:
-            todo = [ch for ch in (0, 1)
-                    if asr_mod.load_cached_words(
-                        asr_mod.cache_path(data_root, spec.name, sid, ch)) is None]
-            if todo:
+        if _cached(sid):
+            tracker.add(audio_seconds=_cached_duration(sid))
+    if tracker.done:
+        tracker.save()
+        tracker.log_line(log)
+
+    # Retry passes: a session that fails transiently (network blip, expired
+    # signed URL) is retried up to max_attempts times within this run, so
+    # "finished" really means every session is cached or permanently failed.
+    for pass_no in range(1, args.max_attempts + 1):
+        pending = [sid for sid in owned
+                   if not _cached(sid)
+                   and (args.retry_failed or failed.get(sid, 0) < args.max_attempts)]
+        if not pending:
+            break
+        if pass_no > 1:
+            log.info("retry pass %d/%d: %d sessions still pending",
+                     pass_no, args.max_attempts, len(pending))
+            time.sleep(30.0)
+        for sid in pending:
+            log.info("transcribing session %s (done %d/%d)", sid, tracker.done, len(owned))
+            try:
                 meta, flac = load_tar_session(spec, store, smap[sid], sid)
                 data, sr = sf.read(io.BytesIO(flac), dtype="float32", always_2d=True)
-                for ch in todo:
+                for ch in (0, 1):
+                    if asr_mod.load_cached(_cache(sid, ch)) is not None:
+                        continue
                     mono = np.ascontiguousarray(data[:, ch])
                     regions = merge_regions(energy_vad(mono, sr), max_region_s=60.0)
                     w = asr_mod.transcribe_regions(engine, mono, sr, regions)
-                    asr_mod.save_cached_words(
-                        asr_mod.cache_path(data_root, spec.name, sid, ch), regions, w)
-            tracker.add(audio_seconds=meta.duration_s)
-        except Exception:
-            err = traceback.format_exc()
-            log.error("FAILED session %s (attempt %d):\n%s", sid,
-                      failed.get(sid, 0) + 1, err)
-            _record_failure(failed_path, sid, -1, err)
-            failed[sid] = failed.get(sid, 0) + 1
-            if failed[sid] >= args.max_attempts:
-                tracker.add(failed=True)
-        tracker.save()
-        tracker.log_line(log)
-        if args.max_items and tracker.session_done >= args.max_items:
-            tracker.save("paused")
-            return
+                    asr_mod.save_cached_words(_cache(sid, ch), regions, w)
+                    tracker.save()  # heartbeat: keep the watchdog's updated_ts fresh
+                tracker.add(audio_seconds=meta.duration_s)
+            except Exception:
+                err = traceback.format_exc()
+                log.error("FAILED session %s (attempt %d):\n%s", sid,
+                          failed.get(sid, 0) + 1, err)
+                _record_failure(failed_path, sid, -1, err)
+                failed[sid] = failed.get(sid, 0) + 1
+                if failed[sid] >= args.max_attempts:
+                    tracker.add(failed=True)
+            tracker.save()
+            tracker.log_line(log)
+            if args.max_items and tracker.session_done >= args.max_items:
+                tracker.save("paused")
+                return
     tracker.save("finished")
     log.info("shard %d FINISHED: %d sessions transcribed, %d failed",
              args.shard, tracker.done, tracker.failed)
@@ -563,6 +594,7 @@ def _run_real_locked(args, log_dir: Path):
                 continue
             if not args.retry_failed and failed.get(sid, 0) >= args.max_attempts:
                 continue
+            log.info("processing session %s (done %d/%d)", sid, tracker.done, total)
             try:
                 dur_s = _real_process_session(
                     args, spec, sid, store, smap, mimi, tokenizer, cfg,

@@ -43,19 +43,32 @@ def resolve_hf_url(repo_id: str, path: str, token: str | None = None,
 
 
 def make_fetch(url: str, session: requests.Session | None = None,
-               retries: int = 4):
-    """Range-GET fetcher with retries. Returns fetch(offset, nbytes) -> bytes."""
+               retries: int = 4, refresh=None):
+    """Range-GET fetcher with retries. Returns fetch(offset, nbytes) -> bytes.
+
+    HF's signed CDN URLs expire after ~1 h, so when ``refresh`` is given (a
+    zero-arg callable returning a fresh URL) an HTTP 401/403 response triggers
+    a re-resolve and the request is retried with the new URL instead of
+    burning a retry attempt on a dead URL."""
     sess = session or requests.Session()
+    cur = {"url": url}
 
     def fetch(off: int, n: int) -> bytes:
         last: Exception | None = None
         for attempt in range(retries):
             try:
-                r = sess.get(url, headers={"Range": f"bytes={off}-{off + n - 1}"},
+                r = sess.get(cur["url"],
+                             headers={"Range": f"bytes={off}-{off + n - 1}"},
                              timeout=300)
                 if r.status_code in (200, 206):
                     return r.content
-                last = RuntimeError(f"range GET {url} -> HTTP {r.status_code}")
+                last = RuntimeError(
+                    f"range GET {cur['url'][:120]}... -> HTTP {r.status_code}")
+                if r.status_code in (401, 403) and refresh is not None:
+                    logger.info("signed URL rejected (HTTP %d); re-resolving",
+                                r.status_code)
+                    cur["url"] = refresh()
+                    continue  # retry immediately with the fresh URL
             except requests.RequestException as e:  # noqa: PERF203
                 last = e
             time.sleep(1.0 + attempt)
@@ -150,7 +163,8 @@ def tar_index(size: int, fetch, cache_path: str | Path | None = None
                 idx[m.name] = (m.offset_data, m.size)
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache_path.with_name(cache_path.name + ".tmp")
+        # pid-unique tmp: concurrent workers may build the same shard index
+        tmp = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(idx), encoding="utf-8")
         os.replace(tmp, cache_path)
     return idx

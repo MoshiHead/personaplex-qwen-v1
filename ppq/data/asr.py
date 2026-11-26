@@ -28,15 +28,26 @@ def cache_path(data_root: str | Path, source: str, session_id: str,
             / f"ch{channel}.json")
 
 
-def load_cached_words(path: str | Path) -> list[tuple[str, float, float]] | None:
+def load_cached(path: str | Path) -> dict | None:
+    """Full cache dict ({"regions": ..., "words": ...}) or None."""
     path = Path(path)
     if not path.exists():
         return None
     try:
-        d = json.loads(path.read_text(encoding="utf-8"))
-        return [(w, float(s), float(e)) for w, s, e in d.get("words", [])]
+        return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, ValueError, TypeError):
         logger.warning("ignoring unreadable ASR cache %s", path)
+        return None
+
+
+def load_cached_words(path: str | Path) -> list[tuple[str, float, float]] | None:
+    d = load_cached(path)
+    if d is None:
+        return None
+    try:
+        return [(w, float(s), float(e)) for w, s, e in d.get("words", [])]
+    except (ValueError, TypeError):
+        logger.warning("ignoring malformed ASR cache %s", path)
         return None
 
 
@@ -58,6 +69,12 @@ class WhisperASR:
         import torch
         from transformers import pipeline
         dev = 0 if (device == "cuda" and torch.cuda.is_available()) else -1
+        if dev >= 0:
+            logger.info("Whisper ASR on GPU: %s", torch.cuda.get_device_name(0))
+        else:
+            logger.warning(
+                "CUDA not available - Whisper ASR falling back to CPU, which is "
+                "VERY slow. Check CUDA_VISIBLE_DEVICES and the torch build.")
         dtype = torch.float16 if dev >= 0 else torch.float32
         self.pipe = pipeline("automatic-speech-recognition", model=model_id,
                              device=dev, torch_dtype=dtype)

@@ -102,13 +102,20 @@ QWEN_TOKENIZER = "/workspace/models/qwen3-1.7b-base"  # local snapshot of Qwen/Q
 # auto-downloaded by vLLM). On a 32 GB card, "Qwen/Qwen3-4B" also works well.
 GEN_MODEL = "/workspace/models/qwen3-8b"
 DATA_ROOT = Path("/workspace/ppq_data")
-N_GPUS = 2                   # how many GPUs this box has (works with 1)
+N_GPUS = 2                   # worker shards per stage; shard i is pinned to GPU i % N_PHYSICAL_GPUS
 TARGET_SCRIPTS = 35000   # ~35k x ~80 s ~= 800 h of dialogue
 MAX_ATTEMPTS = 3         # per-dialogue retry limit before it is skipped for good
 
 RESUME = True                # False = archive previous outputs and start over
 FRESH_START_CONFIRM = ""     # type "FRESH" here when RESUME = False
 # --------------------
+
+import torch
+N_PHYSICAL_GPUS = max(1, torch.cuda.device_count())  # auto-detected
+print(f"physical GPUs: {N_PHYSICAL_GPUS} | worker shards per stage: {N_GPUS}")
+if N_GPUS > N_PHYSICAL_GPUS:
+    print(f"note: {N_GPUS} shards share {N_PHYSICAL_GPUS} GPU(s) "
+          "(shard i -> GPU i % N_PHYSICAL_GPUS)")
 
 # Locate the repos (folder names may differ from the defaults, e.g. a GitHub
 # clone named personaplex-qwen-v1). Fails loudly HERE, not at a later import.
@@ -409,7 +416,8 @@ def launch_workers(stage: str, extra_args=()):
                "--out", str(TOKENS_DIR), "--log-dir", str(LOG_DIR),
                "--mimi-weight", MIMI_WEIGHT, "--tokenizer", QWEN_TOKENIZER,
                "--max-attempts", str(MAX_ATTEMPTS), "--seed", "0", *extra_args]
-        subprocess.Popen(cmd, env={**os.environ, "CUDA_VISIBLE_DEVICES": str(shard)},
+        gpu = shard % N_PHYSICAL_GPUS  # share GPUs when shards > physical GPUs
+        subprocess.Popen(cmd, env={**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu)},
                          stdout=console, stderr=subprocess.STDOUT,
                          start_new_session=True)
         launched.append(shard)
@@ -867,7 +875,7 @@ MOSHI_REPO = "/workspace/personaplex"              # original personaplex repo (
 MIMI_WEIGHT = "/workspace/models/mimi.safetensors" # moshi mimi codec weights
 QWEN_TOKENIZER = "/workspace/models/qwen3-1.7b-base"  # local snapshot of Qwen/Qwen3-1.7B-Base
 DATA_ROOT = Path("/workspace/ppq_data")
-N_GPUS = 2                   # how many GPUs this box has (works with 1)
+N_GPUS = 2                   # worker shards per stage; shard i is pinned to GPU i % N_PHYSICAL_GPUS
 SELECTED_SOURCES = ["task-20h", "task-v2", "video-21h", "turn-104h"]
 ASR_MODEL = "openai/whisper-large-v3-turbo"
 MAX_ATTEMPTS = 3             # per-session retry limit before it is skipped for good
@@ -875,6 +883,13 @@ MAX_ATTEMPTS = 3             # per-session retry limit before it is skipped for 
 RESUME = True                # False = archive previous HF-pipeline outputs and start over
 FRESH_START_CONFIRM = ""     # type "FRESH" here when RESUME = False
 # --------------------
+
+import torch
+N_PHYSICAL_GPUS = max(1, torch.cuda.device_count())  # auto-detected
+print(f"physical GPUs: {N_PHYSICAL_GPUS} | worker shards per stage: {N_GPUS}")
+if N_GPUS > N_PHYSICAL_GPUS:
+    print(f"note: {N_GPUS} shards share {N_PHYSICAL_GPUS} GPU(s) "
+          "(shard i -> GPU i % N_PHYSICAL_GPUS)")
 
 def _locate_repo(preferred: str, marker: str, fallbacks=()) -> str:
     cands = [preferred, *fallbacks]
@@ -1005,7 +1020,8 @@ def launch_hf_workers(stage: str, source: str, extra_args=()):
                "--mimi-weight", MIMI_WEIGHT, "--tokenizer", QWEN_TOKENIZER,
                "--asr-model", ASR_MODEL, "--device", "cuda",
                "--max-attempts", str(MAX_ATTEMPTS), *extra_args]
-        subprocess.Popen(cmd, env={**os.environ, "CUDA_VISIBLE_DEVICES": str(shard)},
+        gpu = shard % N_PHYSICAL_GPUS  # share GPUs when shards > physical GPUs
+        subprocess.Popen(cmd, env={**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu)},
                          stdout=console, stderr=subprocess.STDOUT,
                          start_new_session=True)
         launched.append(shard)

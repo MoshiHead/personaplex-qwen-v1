@@ -420,7 +420,11 @@ class TarStore:
     def _client(self, shard: str):
         if shard not in self._clients:
             url, size = resolve_hf_url(self.spec.repo_id, shard, self.token)
-            self._clients[shard] = (make_fetch(url), size)
+            # Signed CDN URLs expire after ~1 h; make_fetch re-resolves on
+            # HTTP 401/403 so long-running workers don't start failing.
+            def refresh() -> str:
+                return resolve_hf_url(self.spec.repo_id, shard, self.token)[0]
+            self._clients[shard] = (make_fetch(url, refresh=refresh), size)
         return self._clients[shard]
 
     def index(self, shard: str) -> dict[str, tuple[int, int]]:
@@ -464,7 +468,8 @@ def list_sessions(spec: SourceSpec, data_root: str | Path, token: str | None) ->
     if not sids:
         raise RuntimeError(f"no sessions found for {spec.name} ({spec.repo_id})")
     cache.parent.mkdir(parents=True, exist_ok=True)
-    tmp = cache.with_name(cache.name + ".tmp")
+    # pid-unique tmp: concurrent workers may build the session list together
+    tmp = cache.with_name(f"{cache.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(sids), encoding="utf-8")
     os.replace(tmp, cache)
     return sids

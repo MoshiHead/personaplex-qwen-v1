@@ -16,7 +16,7 @@ import torch
 import ppq.checkpoint
 import ppq.text_tokenizer
 from ppq.config import FRAME_RATE_HZ, PPQModelConfig, SAMPLE_RATE
-from ppq.data import mimi_tokenize, oto_sources, realconv, worker
+from ppq.data import asr, hf_tar, mimi_tokenize, oto_sources, realconv, worker
 from ppq.progress import read_jsonl
 
 
@@ -577,3 +577,151 @@ def test_real_worker_resume_is_identical(tmp_path, real_fakes):
     prog = json.loads((tmp_path / "logs-out_a"
                        / "progress-real-task-20h-0000.json").read_text(encoding="utf-8"))
     assert prog["status"] == "finished" and prog["done"] == 2 and prog["total"] == 2
+
+
+# ---------------------------------------------------------------------------
+# make_fetch: signed-URL refresh on 401/403 (HF CDN URLs expire after ~1 h)
+# ---------------------------------------------------------------------------
+
+class _Resp:
+    def __init__(self, code, content=b""):
+        self.status_code = code
+        self.content = content
+
+
+class _FlakySession:
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url, headers=None, timeout=None):
+        self.calls.append(url)
+        if "dead" in url:
+            return _Resp(403)
+        return _Resp(206, b"DATA")
+
+
+def test_make_fetch_refreshes_expired_url(monkeypatch):
+    monkeypatch.setattr(hf_tar.time, "sleep", lambda *_: None)
+    sess = _FlakySession()
+    fetch = hf_tar.make_fetch("http://dead-signed-url", session=sess,
+                              refresh=lambda: "http://fresh-signed-url")
+    assert fetch(0, 4) == b"DATA"
+    assert sess.calls == ["http://dead-signed-url", "http://fresh-signed-url"]
+
+
+def test_make_fetch_403_without_refresh_fails(monkeypatch):
+    monkeypatch.setattr(hf_tar.time, "sleep", lambda *_: None)
+    sess = _FlakySession()
+    fetch = hf_tar.make_fetch("http://dead-signed-url", session=sess, retries=2)
+    with pytest.raises(RuntimeError, match="HTTP 403"):
+        fetch(0, 4)
+    assert len(sess.calls) == 2
+
+
+def test_asr_load_cached_roundtrip(tmp_path):
+    p = tmp_path / "ch0.json"
+    asr.save_cached_words(p, [(0.0, 5.0)], [("a", 1.0, 1.2)])
+    d = asr.load_cached(p)
+    assert d["regions"] == [[0.0, 5.0]] and d["words"] == [["a", 1.0, 1.2]]
+    assert asr.load_cached_words(p) == [("a", 1.0, 1.2)]
+    p.write_text('{"regions": [], "words": "garbage"}', encoding="utf-8")
+    assert asr.load_cached_words(p) is None      # malformed words -> treated missing
+    assert asr.load_cached(p) is not None        # raw dict still readable
+
+
+# ---------------------------------------------------------------------------
+# worker --stage asr: cached sessions counted, transient failures retried
+# in a second pass within the same run (no NameError on the resume path)
+# ---------------------------------------------------------------------------
+
+def _asr_args(tmp_path: Path, name: str, **kw):
+    a = types.SimpleNamespace(
+        stage="asr", source="task-20h", shard=0, num_shards=1,
+        scripts="", out=str(tmp_path / f"out-{name}"),
+        mimi_weight="fake", tokenizer="fake", model_config="",
+        voice_prompt="", max_hours=1.0,
+        log_dir=str(tmp_path / f"logs-{name}"),
+        seed=0, max_attempts=3, retry_failed=False, max_items=0,
+        data_root=str(tmp_path / f"root-{name}"), hf_token_env="HF_TOKEN",
+        device="cpu", asr_model="fake",
+        min_chunk_s=20.0, max_chunk_s=80.0, min_silence_s=0.8,
+        min_agent_speech=0.15, min_separation_db=12.0,
+        voice_prompt_seconds=8.0, voice_prompt_mode="",
+        segment_frames=1250, long_segment_s=4.0, keep_raw=False,
+    )
+    for k, v in kw.items():
+        setattr(a, k, v)
+    return a
+
+
+def test_asr_worker_resume_and_retry_pass(tmp_path, monkeypatch):
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", lambda *_: None)  # skip retry-pass wait
+
+    flac = _flac_bytes()
+    boom = {"s2": 1}  # s2 fails once, then succeeds (transient network error)
+
+    def meta_for(sid):
+        return oto_sources.SessionMeta(
+            source="task-20h", session_id=sid, duration_s=30.0,
+            speakers=[{"speaker_id": "a"}, {"speaker_id": "b"}],
+            system_prompts=["p0", "p1"], redactions=[])
+
+    class FakeStore:
+        def __init__(self, *a, **k):
+            pass
+
+        def session_map(self):
+            return {"s1": {}, "s2": {}}
+
+    def fake_load(spec, store, entry, sid):
+        if boom.get(sid, 0) > 0:
+            boom[sid] -= 1
+            raise RuntimeError("boom (transient)")
+        return meta_for(sid), flac
+
+    class FakeASR:
+        pipe = types.SimpleNamespace(device="cpu")
+
+        def __init__(self, *a, **k):
+            pass
+
+        def transcribe_words(self, wav, sr):
+            return [("word", 0.0, 0.2)]
+
+    monkeypatch.setattr(oto_sources, "list_sessions",
+                        lambda spec, root, token: ["s1", "s2"])
+    monkeypatch.setattr(oto_sources, "TarStore", FakeStore)
+    monkeypatch.setattr(oto_sources, "get_hf_token", lambda env: None)
+    monkeypatch.setattr(oto_sources, "load_tar_session", fake_load)
+    monkeypatch.setattr(asr, "WhisperASR", FakeASR)
+
+    # s1 fully cached by an "earlier run" (25 s of speech regions)
+    root = tmp_path / "root-x"
+    for ch in (0, 1):
+        asr.save_cached_words(asr.cache_path(root, "task-20h", "s1", ch),
+                              [(0.0, 25.0)], [("hi", 1.0, 1.2)])
+
+    worker.run_asr(_asr_args(tmp_path, "x"))
+    prog = json.loads((tmp_path / "logs-x" / "progress-asr-task-20h-0000.json")
+                      .read_text(encoding="utf-8"))
+    assert prog["status"] == "finished"
+    assert prog["done"] == 2 and prog["failed"] == 0   # s1 cached + s2 retried
+    # audio_hours is rounded to 2 decimals in the progress JSON
+    assert prog["audio_hours"] == round((25.0 + 30.0) / 3600, 2)
+    # s2's one transient failure was recorded, and it is NOT a NameError
+    fails = read_jsonl(tmp_path / "logs-x" / "failed-asr-task-20h-0000.jsonl")
+    assert len(fails) == 1 and "boom (transient)" in fails[0]["error"]
+    assert "NameError" not in fails[0]["error"]
+    # both channels of s2 got transcribed and cached
+    for ch in (0, 1):
+        assert asr.load_cached_words(
+            asr.cache_path(root, "task-20h", "s2", ch)) is not None
+
+    # second run: everything cached -> no new failures, still done=2
+    worker.run_asr(_asr_args(tmp_path, "x"))
+    fails = read_jsonl(tmp_path / "logs-x" / "failed-asr-task-20h-0000.jsonl")
+    assert len(fails) == 1
+    prog = json.loads((tmp_path / "logs-x" / "progress-asr-task-20h-0000.json")
+                      .read_text(encoding="utf-8"))
+    assert prog["status"] == "finished" and prog["done"] == 2
