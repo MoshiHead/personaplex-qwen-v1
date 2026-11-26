@@ -954,9 +954,9 @@ HF_CELLS.append(md("""
 
 HF_CELLS.append(code("""
 subprocess.run([sys.executable, "-m", "pip", "install", "-q",
-    "soundfile", "pyloudnorm", "sphn", "safetensors",
+    "soundfile", "pyloudnorm", "sphn", "safetensors", "einops",
     "huggingface_hub", "requests", "transformers>=4.56", "accelerate"], check=True)
-import soundfile, transformers  # noqa
+import soundfile, transformers, einops  # noqa
 print("deps ok: transformers", transformers.__version__)
 """))
 
@@ -974,6 +974,28 @@ for name in SELECTED_SOURCES:
     spec = SOURCES[name]
     info = api.dataset_info(spec.repo_id)  # raises if the gated terms are not accepted
     print(f"OK  {name:<10} {spec.repo_id} (gated={info.gated})")
+"""))
+
+HF_CELLS.append(code("""
+# Download the model files the workers need (idempotent - skips what exists).
+# mimi: the moshi codec weights from the personaplex repo (gated - uses HF_TOKEN).
+# qwen: tokenizer files only (a few MB; the 1.7B weights are NOT needed here).
+import shutil
+from huggingface_hub import hf_hub_download, snapshot_download
+
+Path(MIMI_WEIGHT).parent.mkdir(parents=True, exist_ok=True)
+if not Path(MIMI_WEIGHT).exists():
+    src = hf_hub_download("nvidia/personaplex-7b-v1",
+                          "tokenizer-e351c8d8-checkpoint125.safetensors",
+                          token=os.environ.get("HF_TOKEN"))
+    shutil.copy(src, MIMI_WEIGHT)
+print("mimi:", MIMI_WEIGHT,
+      f"({Path(MIMI_WEIGHT).stat().st_size / 2**20:.0f} MiB)")
+
+if not (Path(QWEN_TOKENIZER) / "tokenizer.json").exists():
+    snapshot_download(repo_id="Qwen/Qwen3-1.7B-Base", local_dir=QWEN_TOKENIZER,
+                      allow_patterns=["*.json", "*.txt"])
+print("qwen tokenizer:", QWEN_TOKENIZER)
 """))
 
 HF_CELLS.append(code("""
