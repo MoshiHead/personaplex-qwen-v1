@@ -553,6 +553,13 @@ To restart a stage from scratch, delete its `checkpoints/` directory.
 TRAIN_CELLS.append(CLONE_CELL)
 
 TRAIN_CELLS.append(code("""
+import subprocess, sys
+subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+    "huggingface_hub", "safetensors", "einops", "sphn"], check=True)
+print("deps ok")
+"""))
+
+TRAIN_CELLS.append(code("""
 import os, sys, json, subprocess
 from pathlib import Path
 
@@ -701,14 +708,16 @@ tcfg_a = TrainConfig(
     output_dir=str(STAGE_A_DIR),
     init_checkpoint=str(RUN_DIR / "init"),
     stage="a_audio_warmup",
-    # 32 GB cards: batch_size=2 per GPU. On 80 GB cards use batch_size=4,
-    # grad_accum=1. Effective batch = batch_size x grad_accum x N_GPUS.
-    batch_size=2, grad_accum=2,
+    # 32 GB cards: batch_size=1 + grad checkpointing (the depformer runs
+    # 1250 sequential frames, so activations dominate memory). On 80 GB cards
+    # use batch_size=4, grad_accum=1. Effective batch = batch x accum x N_GPUS.
+    # Still OOM? Lower segment_frames (e.g. 750 = 60 s) - crops are random.
+    batch_size=1, grad_accum=4,
     max_steps=400,               # ~= 400 x (4 x N_GPUS) x 100 s of audio seen
     save_every=200, save_every_minutes=30, keep_last_k=3,
     log_every=10,
     fsdp=False,                  # DDP; resume of optimizer state needs fsdp=False
-    gradient_checkpointing=False,
+    gradient_checkpointing=True,
 )
 tcfg_a.to_json(STAGE_A_DIR / "config.json")
 print(STAGE_A_DIR / "config.json")
@@ -733,6 +742,8 @@ def launch_stage(stage_dir: Path):
         if pid > 0 and pid_alive(pid):
             print(stage_dir.name, "is already running - just watch it below")
             return
+    # reduces allocator fragmentation on long runs (OOM-message recommendation)
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     console = open(logs / "console.log", "ab", buffering=0)
     proc = subprocess.Popen([
         "torchrun", "--nproc_per_node", str(N_GPUS), "--max-restarts", "3",
@@ -768,8 +779,9 @@ tcfg_b = TrainConfig(
     output_dir=str(STAGE_B_DIR),
     init_checkpoint=str(STAGE_A_DIR / "checkpoints" / "final"),
     stage="b_full",
-    # 32 GB cards: batch_size=2 + grad checkpointing. 80 GB cards: batch_size=4.
-    batch_size=2, grad_accum=2,
+    # 32 GB cards: batch_size=1 + grad checkpointing. 80 GB cards: batch_size=4,
+    # grad_accum=1. Still OOM? Lower segment_frames (e.g. 750 = 60 s).
+    batch_size=1, grad_accum=4,
     max_steps=1000,
     lr=5e-6, backbone_lr_mult=0.5, depformer_lr_mult=1.5,
     lora_rank=64,
