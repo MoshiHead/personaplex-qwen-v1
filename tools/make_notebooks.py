@@ -606,6 +606,50 @@ RUN_DIR.mkdir(parents=True, exist_ok=True)
 """))
 
 TRAIN_CELLS.append(code("""
+# Download the model files training needs (idempotent - skips what exists).
+# - FULL Qwen3-1.7B-Base weights (~3.4 GB; the HF data notebook fetched only
+#   the tokenizer files, which are enough for tokenization but not training).
+# - PersonaPlex LM checkpoint (depformer donor; gated repo - needs HF_TOKEN).
+# - mimi codec weights (only if the data notebook did not fetch them already).
+import getpass, shutil
+from huggingface_hub import hf_hub_download, snapshot_download
+
+if not os.environ.get("HF_TOKEN"):
+    os.environ["HF_TOKEN"] = getpass.getpass(
+        "HF token (for nvidia/personaplex-7b-v1): ")
+
+if not list(Path(QWEN_BASE).glob("*.safetensors")):
+    snapshot_download(repo_id="Qwen/Qwen3-1.7B-Base", local_dir=QWEN_BASE)
+print("qwen weights:", QWEN_BASE)
+
+Path(PERSONAPLEX_CKPT).parent.mkdir(parents=True, exist_ok=True)
+if not Path(PERSONAPLEX_CKPT).exists():
+    src = None
+    for name in ("model.sft", "model.safetensors"):
+        try:
+            src = hf_hub_download("nvidia/personaplex-7b-v1", name,
+                                  token=os.environ["HF_TOKEN"])
+            break
+        except Exception:
+            continue
+    if src is None:
+        raise RuntimeError(
+            "no LM weights found in nvidia/personaplex-7b-v1 - "
+            "accept the model license on its HF page first")
+    shutil.copy(src, PERSONAPLEX_CKPT)
+print("personaplex ckpt:", PERSONAPLEX_CKPT,
+      f"({Path(PERSONAPLEX_CKPT).stat().st_size / 2**30:.1f} GiB)")
+
+Path(MIMI_WEIGHT).parent.mkdir(parents=True, exist_ok=True)
+if not Path(MIMI_WEIGHT).exists():
+    src = hf_hub_download("nvidia/personaplex-7b-v1",
+                          "tokenizer-e351c8d8-checkpoint125.safetensors",
+                          token=os.environ["HF_TOKEN"])
+    shutil.copy(src, MIMI_WEIGHT)
+print("mimi:", MIMI_WEIGHT)
+"""))
+
+TRAIN_CELLS.append(code("""
 # Where are we? (safe to re-run any time)
 from ppq.progress import training_status
 print(training_status(RUN_DIR))
