@@ -273,7 +273,11 @@ def main(config_path: str | None = None):
         load_from = Path(tcfg.init_checkpoint) if tcfg.init_checkpoint else out_dir / "init"
         lora_overlay = Path(init_dir) / "model.safetensors"
     logger.info("loading initial model from %s", load_from)
-    model = load_pretrained(load_from, device="cpu", dtype=torch.float32)
+    # Load in bf16 (the native checkpoint dtype). fp32 "master weights" double
+    # params+grads and, with fp32 Adam states on ~1.9B trainable params, need
+    # ~37 GB - can never fit a 32 GB card. Full-bf16 (params+grads+states,
+    # fp32 loss upcast in compute_losses) needs ~18 GB static.
+    model = load_pretrained(load_from, device="cpu", dtype=torch.bfloat16)
     model.cfg = tcfg.model  # pick up any config overrides
     freeze_for_stage(model, tcfg.stage, logger)
     model = maybe_apply_lora(model, tcfg)
