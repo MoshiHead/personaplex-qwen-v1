@@ -1,6 +1,7 @@
-"""Regenerate the two DGX notebooks:
+"""Regenerate the three DGX notebooks:
   notebooks/ppq_data_pipeline.ipynb
   notebooks/ppq_training.ipynb
+  notebooks/ppq_huggingface_data_pipeline.ipynb
 
 Run: python tools/make_notebooks.py
 """
@@ -373,9 +374,8 @@ simply resumes where its manifest ends.
 DATA_CELLS.append(code("""
 import soundfile as sf
 from ppq.data.tts_kokoro import KokoroTTS
-from ppq.config import PPQModelConfig
 
-cfg = PPQModelConfig()
+VOICE_PROMPT_SECONDS = 8.0  # matches the worker's --voice-prompt-seconds default
 VOICE_PROMPT = DATA_ROOT / "voice_prompt_agent.wav"
 if not VOICE_PROMPT.exists():
     tts = KokoroTTS()
@@ -383,9 +383,9 @@ if not VOICE_PROMPT.exists():
         "Hello there! It is lovely to chat with you today. "
         "I am always happy to help with whatever is on your mind, "
         "so feel free to ask me anything at all.", voice="af_heart")
-    n = int(cfg.voice_prompt_duration * 24000)
+    n = int(VOICE_PROMPT_SECONDS * 24000)
     sf.write(VOICE_PROMPT, res.wav[:n], 24000)
-print("voice prompt:", VOICE_PROMPT, f"({cfg.voice_prompt_duration}s)")
+print("voice prompt:", VOICE_PROMPT, f"({VOICE_PROMPT_SECONDS}s)")
 """))
 
 DATA_CELLS.append(code("""
@@ -819,10 +819,348 @@ print(" ".join(cmd))
 
 
 # ===========================================================================
+# Hugging Face real-conversation data notebook
+# ===========================================================================
+
+HF_CELLS = []
+
+HF_CELLS.append(md("""
+# PPQ Hugging Face Data Pipeline (real conversations)
+
+Turns the four gated **otoearth otoSpeech** datasets into PPQ training tokens
+(`codes [17,T]` + `loss_mask` npz samples + `manifest-real-*.jsonl` in
+`DATA_ROOT/tokens`, the same format the synth pipeline writes):
+
+| source | HF repo | license | transcripts | voice prompt |
+|---|---|---|---|---|
+| video-21h | otoearth/otoSpeech-video-full-duplex-21h | custom (no redistribution, no voice cloning) | bundled word timestamps | none |
+| task-20h | otoearth/otoSpeech-full-duplex-task-oriented-20h | CC BY 4.0 | Whisper ASR (this notebook) | same speaker |
+| task-v2 | otoearth/otoSpeech-full-duplex-task-oriented-v2 | CC BY 4.0 | Whisper ASR (this notebook) | same speaker |
+| turn-104h | otoearth/otoSpeech-full-duplex-turn-104h | research use, Voice Identity clause | SRT + Whisper for long segments | none |
+
+**Before running:** accept the gated terms on each dataset page with the same
+HF account whose token you paste below. Redacted segments are kept as audio
+context but their loss is zeroed; video/turn samples are built WITHOUT a voice
+prompt (license); task samples use a same-speaker prompt clip (CC BY 4.0,
+attribution required).
+
+Stages (one worker per GPU, crash-safe resume like the synth pipeline):
+1. `asr` — warms the Whisper word cache for the CC-BY task sets (resumable).
+2. `real` — streams sessions over HTTP range reads (no full tar downloads;
+   video MP4s and turn combined_audio.wav are never fetched), chunks at mutual
+   silence into 20-80 s segments, tokenizes with Mimi, writes samples.
+
+Audio is loudness-normalized per channel; sessions with < 12 dB channel
+separation (cross-talk) are skipped. Watch cells show done/total/%/ETA per
+shard; failures land in `logs/failed-<stage>-<source>-<shard>.jsonl`.
+"""))
+
+HF_CELLS.append(CLONE_CELL)
+
+HF_CELLS.append(code("""
+import os, sys, json, subprocess, time
+from pathlib import Path
+
+# ---- EDIT THESE ----
+PPQ_REPO = "/workspace/personaplex-qwen"            # this repo (contains ppq/)
+MOSHI_REPO = "/workspace/personaplex"              # original personaplex repo (moshi pkg inside)
+MIMI_WEIGHT = "/workspace/models/mimi.safetensors" # moshi mimi codec weights
+QWEN_TOKENIZER = "/workspace/models/qwen3-1.7b-base"  # local snapshot of Qwen/Qwen3-1.7B-Base
+DATA_ROOT = Path("/workspace/ppq_data")
+N_GPUS = 2                   # how many GPUs this box has (works with 1)
+SELECTED_SOURCES = ["task-20h", "task-v2", "video-21h", "turn-104h"]
+ASR_MODEL = "openai/whisper-large-v3-turbo"
+MAX_ATTEMPTS = 3             # per-session retry limit before it is skipped for good
+
+RESUME = True                # False = archive previous HF-pipeline outputs and start over
+FRESH_START_CONFIRM = ""     # type "FRESH" here when RESUME = False
+# --------------------
+
+def _locate_repo(preferred: str, marker: str, fallbacks=()) -> str:
+    cands = [preferred, *fallbacks]
+    for c in cands:
+        if (Path(c) / marker).exists():
+            return str(Path(c).resolve())
+    raise FileNotFoundError(
+        f"repo not found: none of {cands} contains {marker}. "
+        "Set the correct path in the config cell above.")
+
+PPQ_REPO = _locate_repo(PPQ_REPO, "ppq/__init__.py", [
+    "/workspace/personaplex-qwen-v1",
+    str(Path.home() / "personaplex-qwen"),
+    str(Path.home() / "personaplex-qwen-v1"),
+])
+MOSHI_REPO = _locate_repo(MOSHI_REPO, "moshi/moshi/__init__.py", [
+    "/workspace/personaplex-v1",
+    str(Path.home() / "personaplex"),
+])
+
+os.environ["PYTHONPATH"] = f"{MOSHI_REPO}/moshi:{PPQ_REPO}:" + os.environ.get("PYTHONPATH", "")
+for p in (f"{MOSHI_REPO}/moshi", PPQ_REPO):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+import importlib
+importlib.invalidate_caches()
+import ppq  # sanity check - if this fails, PPQ_REPO is still wrong
+print("ppq", ppq.__version__, "from", ppq.__file__)
+
+TOKENS_DIR = DATA_ROOT / "tokens"
+LOG_DIR = DATA_ROOT / "logs"
+DATA_ROOT.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+if not RESUME:
+    assert FRESH_START_CONFIRM == "FRESH", "type FRESH to confirm a fresh start"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for name in ("markers", "asr_cache", "raw", "hf_cache"):
+        p = DATA_ROOT / name
+        if p.exists():
+            target = DATA_ROOT / f"archive-{p.name}-{stamp}"
+            p.rename(target)
+            print("archived", p, "->", target)
+    for m in TOKENS_DIR.glob("manifest-real-*.jsonl"):
+        for line in m.read_text(encoding="utf-8").splitlines():
+            try:
+                f = Path(json.loads(line).get("path", ""))
+            except json.JSONDecodeError:
+                continue
+            if f.exists():
+                f.unlink()
+        m.unlink()
+        print("removed", m)
+
+print("data root:", DATA_ROOT, "| logs:", LOG_DIR, "| sources:", SELECTED_SOURCES)
+"""))
+
+HF_CELLS.append(md("""
+## 1. Dependencies + HF token
+"""))
+
+HF_CELLS.append(code("""
+subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+    "soundfile", "pyloudnorm", "sphn", "safetensors",
+    "huggingface_hub", "requests", "transformers>=4.56", "accelerate"], check=True)
+import soundfile, transformers  # noqa
+print("deps ok: transformers", transformers.__version__)
+"""))
+
+HF_CELLS.append(code("""
+# HF token with access to the four gated otoearth datasets (input hidden).
+# The token is only kept in this kernel's HF_TOKEN env var - never written to disk.
+import getpass
+from huggingface_hub import HfApi
+from ppq.data.oto_sources import SOURCES
+
+if not os.environ.get("HF_TOKEN"):
+    os.environ["HF_TOKEN"] = getpass.getpass("HF token: ")
+api = HfApi(token=os.environ["HF_TOKEN"])
+for name in SELECTED_SOURCES:
+    spec = SOURCES[name]
+    info = api.dataset_info(spec.repo_id)  # raises if the gated terms are not accepted
+    print(f"OK  {name:<10} {spec.repo_id} (gated={info.gated})")
+"""))
+
+HF_CELLS.append(code("""
+# What will be built, per source (license-driven choices are baked into SOURCES).
+from ppq.data.oto_sources import SOURCES
+
+for name in SELECTED_SOURCES:
+    s = SOURCES[name]
+    print(f"{s.name:<10} kind={s.kind:<6} asr={s.asr_mode:<14} "
+          f"voice_prompt={s.voice_prompt_mode:<12} license={s.license}")
+    print(f"  {s.license_note}")
+"""))
+
+HF_CELLS.append(md("""
+## 2. Worker launcher (shared by both stages)
+
+Same pattern as the synth pipeline: one detached worker per GPU, PID-file
+guarded, append-only logs, per-shard progress JSON. Re-running a launch cell
+never duplicates a live worker; crashed shards resume where they stopped.
+"""))
+
+HF_CELLS.append(code("""
+from ppq.progress import pid_alive, pipeline_all_done, render_data_progress
+
+def launch_hf_workers(stage: str, source: str, extra_args=()):
+    launched, running = [], []
+    for shard in range(N_GPUS):
+        pid_file = LOG_DIR / f"worker-{stage}-{source}-{shard:04d}.pid"
+        if pid_file.exists():
+            try:
+                pid = int(pid_file.read_text().strip())
+            except ValueError:
+                pid = -1
+            if pid > 0 and pid_alive(pid):
+                running.append(shard)
+                continue
+        console = open(LOG_DIR / f"worker-{stage}-{source}-{shard:04d}.console.log",
+                       "ab", buffering=0)
+        cmd = [sys.executable, "-m", "ppq.data.worker",
+               "--stage", stage, "--source", source,
+               "--shard", str(shard), "--num-shards", str(N_GPUS),
+               "--out", str(TOKENS_DIR), "--log-dir", str(LOG_DIR),
+               "--data-root", str(DATA_ROOT),
+               "--mimi-weight", MIMI_WEIGHT, "--tokenizer", QWEN_TOKENIZER,
+               "--asr-model", ASR_MODEL, "--device", "cuda",
+               "--max-attempts", str(MAX_ATTEMPTS), *extra_args]
+        subprocess.Popen(cmd, env={**os.environ, "CUDA_VISIBLE_DEVICES": str(shard)},
+                         stdout=console, stderr=subprocess.STDOUT,
+                         start_new_session=True)
+        launched.append(shard)
+    print(f"{stage}/{source}: launched shards {launched} | already running {running}")
+"""))
+
+HF_CELLS.append(md("""
+## 3. ASR cache warm-up (task sets only)
+
+The CC-BY task sets ship without transcripts, so Whisper runs over energy-VAD
+speech regions first and caches word timestamps under
+`DATA_ROOT/asr_cache/<source>/<session>/ch<k>.json`. video-21h (bundled
+transcripts) and turn-104h (SRT + inline ASR in the real stage) need nothing
+here. Fully cached sessions are skipped, so this stage is resumable and can
+run while earlier shards are still going.
+"""))
+
+HF_CELLS.append(code("""
+from ppq.data.oto_sources import SOURCES
+
+ASR_SOURCES = [s for s in SELECTED_SOURCES if SOURCES[s].asr_mode == "full"]
+asr_stages = tuple(f"asr-{s}" for s in ASR_SOURCES)
+if not ASR_SOURCES:
+    print("no selected source needs the asr stage")
+elif pipeline_all_done(LOG_DIR, asr_stages):
+    print("asr stage already complete")
+    print(render_data_progress(LOG_DIR, asr_stages))
+else:
+    for s in ASR_SOURCES:
+        launch_hf_workers("asr", s)
+"""))
+
+HF_CELLS.append(code("""
+# Live progress - refreshes until all asr shards finish.
+# Interrupt the cell to stop watching (workers keep running); re-run any time.
+from ppq.progress import watch
+if ASR_SOURCES:
+    watch(LOG_DIR, asr_stages, interval_s=60)
+"""))
+
+HF_CELLS.append(md("""
+## 4. Real-conversation tokenization
+
+Streams each session (HTTP range reads - no full tar downloads), resamples to
+24 kHz stereo, loudness-normalizes, checks channel separation, cuts 20-80 s
+chunks at mutual silence, and writes one sample per chunk x role (each
+speaker gets a turn as the agent). turn-104h raw WAVs are deleted after each
+session (keep them with `--keep-raw` in `extra_args`).
+"""))
+
+HF_CELLS.append(code("""
+real_stages = tuple(f"real-{s}" for s in SELECTED_SOURCES)
+if pipeline_all_done(LOG_DIR, real_stages):
+    print("real stage already complete")
+    print(render_data_progress(LOG_DIR, real_stages))
+else:
+    for s in SELECTED_SOURCES:
+        launch_hf_workers("real", s)
+"""))
+
+HF_CELLS.append(code("""
+# Live progress - refreshes until all real shards finish (this is the long one).
+from ppq.progress import watch
+watch(LOG_DIR, real_stages, interval_s=120)
+"""))
+
+HF_CELLS.append(code("""
+# Last lines of each shard log (failures show up here with a full traceback).
+for s in SELECTED_SOURCES:
+    for shard in range(N_GPUS):
+        p = LOG_DIR / f"worker-real-{s}-{shard:04d}.log"
+        if p.exists():
+            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+            print(f"--- {s} shard {shard} (last 2 lines) ---")
+            print(chr(10).join(lines[-2:]))
+"""))
+
+HF_CELLS.append(md("""
+## 5. Validation
+
+Format-checks a sample of every real manifest (shapes, dtypes, token ranges,
+0/1 loss mask, supervised agent frames), then pulls real batches through a
+tiny PPQ model + the real training loss on CPU.
+"""))
+
+HF_CELLS.append(code("""
+from ppq.config import PPQModelConfig, TrainConfig
+from ppq.data.validate import check_manifest, loader_smoke
+
+cfg = PPQModelConfig()
+real_manifests = sorted(TOKENS_DIR.glob("manifest-real-*.jsonl"))
+assert real_manifests, "no real manifests yet - run the real stage first"
+for m in real_manifests:
+    rep = check_manifest(m, cfg, segment_frames=1250)
+    print(f"{m.name}: {rep['entries']} samples, {rep['hours']} h, "
+          f"{rep['duplicate_names']} dupes, {len(rep['errors'])} errors "
+          f"({rep['checked']} checked)")
+    for e in rep["errors"][:5]:
+        print("   ", e)
+
+tcfg = TrainConfig(model=cfg, segment_frames=1250)
+losses = loader_smoke([str(m) for m in real_manifests], tcfg,
+                      n_batches=2, batch_size=2)
+print("loader smoke losses:", {k: round(v, 3) for k, v in losses.items()})
+"""))
+
+HF_CELLS.append(md("""
+## 6. Aggregate stats
+"""))
+
+HF_CELLS.append(code("""
+from ppq.progress import read_jsonl, repair_jsonl
+
+per_source = {}
+for m in sorted(TOKENS_DIR.glob("manifest-real-*.jsonl")):
+    repair_jsonl(m)
+    for e in read_jsonl(m):
+        d = per_source.setdefault(e.get("source", "?"), [0, 0.0])
+        d[0] += 1
+        d[1] += e.get("duration_s", e["frames"] / 12.5)
+for src, (n, sec) in sorted(per_source.items()):
+    print(f"{src:<28} {n:>6} samples {sec / 3600:>8.1f} h")
+print(f"{'TOTAL':<28} {sum(v[0] for v in per_source.values()):>6} samples "
+      f"{sum(v[1] for v in per_source.values()) / 3600:>8.1f} h")
+"""))
+
+HF_CELLS.append(md("""
+## 7. Listen to a sample
+
+Decodes one sample's agent/user code rows back to audio with Mimi.
+"""))
+
+HF_CELLS.append(code("""
+import numpy as np
+import IPython.display as ipd
+from ppq.checkpoint import get_mimi
+from ppq.data.validate import decode_channels
+from ppq.progress import read_jsonl
+
+mimi = get_mimi(MIMI_WEIGHT, "cuda")
+first = read_jsonl(real_manifests[0])[0]
+codes = np.load(first["path"])["codes"]
+agent, user = decode_channels(mimi, codes)
+print(first.get("name", first["path"]), "| source:", first.get("source"))
+ipd.display(ipd.Audio(agent, rate=24000))
+ipd.display(ipd.Audio(user, rate=24000))
+"""))
+
+
+# ===========================================================================
 
 NB_DIR.mkdir(parents=True, exist_ok=True)
 for name, cells in (("ppq_data_pipeline.ipynb", DATA_CELLS),
-                    ("ppq_training.ipynb", TRAIN_CELLS)):
+                    ("ppq_training.ipynb", TRAIN_CELLS),
+                    ("ppq_huggingface_data_pipeline.ipynb", HF_CELLS)):
     path = NB_DIR / name
     with open(path, "w", encoding="utf-8") as f:
         json.dump(notebook(cells), f, indent=1, ensure_ascii=False)

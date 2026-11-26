@@ -37,17 +37,24 @@ def _tile(tokens: np.ndarray, n: int) -> np.ndarray:
     return np.tile(tokens[:, None], (1, n))  # [8, n]
 
 
-def build_conversation_codes(
-    stereo: np.ndarray,
+def assemble_codes(
+    agent_codes: np.ndarray,
+    user_codes: np.ndarray,
     agent_words: list[tuple[str, float, float]],
     system_prompt_ids: list[int],
     voice_prompt_agent_codes: np.ndarray | None,
-    mimi,
     cfg: PPQModelConfig,
+    mask_intervals: list[tuple[float, float]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Returns (codes int32 [17, T], loss_mask float16 [17, T])."""
-    agent_codes = encode_channel(mimi, stereo[0])
-    user_codes = encode_channel(mimi, stereo[1])
+    """Assemble 17-stream codes from pre-encoded channels.
+
+    agent_codes/user_codes: int [8, T] Mimi codes (undelayed). agent_words:
+    [(word, start_s, end_s)] relative to the body (frame 0). mask_intervals:
+    [(start_s, end_s)] in body time where the loss is zeroed on ALL rows
+    (e.g. redacted segments); the audio/text stay as context.
+
+    Returns (codes int32 [17, P+T], loss_mask float16 [17, P+T]).
+    """
     T = min(agent_codes.shape[1], user_codes.shape[1])
     agent_codes = agent_codes[:, :T]
     user_codes = user_codes[:, :T]
@@ -89,7 +96,27 @@ def build_conversation_codes(
     loss_mask[0, P:] = 1.0      # text stream supervised (PAD down-weighted in loss)
     loss_mask[1:9, P:] = 1.0    # agent audio supervised
     loss_mask[9:17, P:] = 1.0   # user audio rows present; weight set in train config
+    for start_s, end_s in mask_intervals or []:
+        f0 = max(0, int(start_s * FRAME_RATE_HZ))
+        f1 = min(T, int(np.ceil(end_s * FRAME_RATE_HZ)))
+        if f1 > f0:
+            loss_mask[:, P + f0: P + f1] = 0.0
     return codes, loss_mask
+
+
+def build_conversation_codes(
+    stereo: np.ndarray,
+    agent_words: list[tuple[str, float, float]],
+    system_prompt_ids: list[int],
+    voice_prompt_agent_codes: np.ndarray | None,
+    mimi,
+    cfg: PPQModelConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Returns (codes int32 [17, T], loss_mask float16 [17, T])."""
+    agent_codes = encode_channel(mimi, stereo[0])
+    user_codes = encode_channel(mimi, stereo[1])
+    return assemble_codes(agent_codes, user_codes, agent_words, system_prompt_ids,
+                          voice_prompt_agent_codes, cfg)
 
 
 # Set by the worker before calling build_conversation_codes (avoids passing

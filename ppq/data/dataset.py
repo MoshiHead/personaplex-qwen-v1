@@ -10,6 +10,7 @@ sample is shorter).
 """
 from __future__ import annotations
 
+import bisect
 import json
 import random
 from pathlib import Path
@@ -24,7 +25,8 @@ from ..config import PPQModelConfig, SILENCE_TOKENS, SINE_TOKENS
 class TokenShardDataset(Dataset):
     def __init__(self, manifest_paths: list[str | Path], cfg: PPQModelConfig,
                  segment_frames: int = 1250, seed: int = 0,
-                 epoch_multiplier: int = 20):
+                 epoch_multiplier: int = 20,
+                 source_weights: dict | None = None):
         self.cfg = cfg
         self.segment_frames = segment_frames
         self.entries: list[dict] = []
@@ -38,12 +40,32 @@ class TokenShardDataset(Dataset):
         self.rng = random.Random(seed)
         # Logical epoch = several passes with different random crops.
         self.epoch_len = len(self.entries) * epoch_multiplier
+        # Optional per-source sampling weights (manifest "source" -> weight).
+        self._cum_weights: list[float] | None = None
+        if source_weights:
+            acc = 0.0
+            cum = []
+            for e in self.entries:
+                acc += float(source_weights.get(e.get("source", ""), 1.0))
+                cum.append(acc)
+            if acc <= 0:
+                raise ValueError(f"source_weights {source_weights} give every "
+                                 "entry zero weight")
+            self._cum_weights = cum
+            self._weight_total = acc
 
     def __len__(self) -> int:
         return self.epoch_len
 
+    def _pick_entry(self, idx: int) -> dict:
+        if self._cum_weights is None:
+            return self.entries[idx % len(self.entries)]
+        i = bisect.bisect_left(self._cum_weights,
+                               self.rng.random() * self._weight_total)
+        return self.entries[min(i, len(self.entries) - 1)]
+
     def __getitem__(self, idx: int) -> dict:
-        entry = self.entries[idx % len(self.entries)]
+        entry = self._pick_entry(idx)
         data = np.load(entry["path"])
         codes = data["codes"].astype(np.int64)          # [17, T]
         mask = data["loss_mask"].astype(np.float32)     # [17, T]

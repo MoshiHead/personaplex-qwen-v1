@@ -11,7 +11,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent / "moshi"))
 
 ok = True
-for name in ("ppq_data_pipeline.ipynb", "ppq_training.ipynb"):
+for name in ("ppq_data_pipeline.ipynb", "ppq_training.ipynb",
+             "ppq_huggingface_data_pipeline.ipynb"):
     path = ROOT / "notebooks" / name
     nb = json.loads(path.read_text(encoding="utf-8"))
     n_code = 0

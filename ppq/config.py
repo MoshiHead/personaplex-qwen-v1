@@ -155,6 +155,10 @@ class TrainConfig:
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     segment_frames: int = 1250     # 100 s at 12.5 fps
+    # Per-source sampling weights (manifest "source" field -> relative weight,
+    # e.g. {"synth": 1.0, "real-task-oriented-20h": 2.0}). Empty = uniform.
+    # Sources not listed default to weight 1.0; weight 0 disables a source.
+    source_weights: dict = field(default_factory=dict)
     # Losses
     text_padding_weight: float = 0.5
     first_codebook_weight_multiplier: float = 100.0

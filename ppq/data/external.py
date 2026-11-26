@@ -34,6 +34,11 @@ def _normalize(wav: np.ndarray, sr: int) -> np.ndarray:
     return pyln.normalize.loudness(wav, loudness, TARGET_LUFS).astype(np.float32)
 
 
+def normalize_loudness(wav: np.ndarray, sr: int) -> np.ndarray:
+    """Public wrapper: loudness-normalize a mono float32 wav to TARGET_LUFS."""
+    return _normalize(wav, sr)
+
+
 def iter_libritts_monologues(max_seconds: float = 100 * 3600,
                              min_seconds: float = 20.0,
                              max_seconds_per: float = 90.0,

@@ -240,7 +240,14 @@ def main(config_path: str | None = None):
     manifests = sorted(glob.glob(str(Path(tcfg.data_dir) / "manifest*.jsonl")))
     assert manifests, f"no manifests found in {tcfg.data_dir}"
     dataset = TokenShardDataset(manifests, tcfg.model, segment_frames=tcfg.segment_frames,
-                                seed=tcfg.seed + start_step + rank)
+                                seed=tcfg.seed + start_step + rank,
+                                source_weights=tcfg.source_weights or None)
+    if tcfg.source_weights:
+        counts: dict[str, int] = {}
+        for e in dataset.entries:
+            counts[e.get("source", "")] = counts.get(e.get("source", ""), 0) + 1
+        logger.info("source_weights=%s | entries per source=%s",
+                    tcfg.source_weights, counts)
     sampler = None
     if distributed:
         sampler = torch.utils.data.DistributedSampler(
