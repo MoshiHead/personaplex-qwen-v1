@@ -144,3 +144,19 @@ def test_lora_grouping_and_merged_final(tmp_path):
     assert not any(k.startswith("base_model.model.") or "lora_" in k for k in state)
     merged = load_pretrained(final_dir, device="cpu")  # strict load, plain model
     assert type(merged) is type(model)
+
+
+def test_eval_per_codebook_accepts_str_device(tmp_path):
+    """eval_per_codebook must accept device as a plain string ("cpu"/"cuda")."""
+    from ppq.data.dataset import TokenShardDataset, collate
+    from ppq.train.evaluate import eval_per_codebook
+
+    model = tiny_model()
+    _write_tokens(tmp_path / "tokens", model.cfg)
+    ds = TokenShardDataset([tmp_path / "tokens" / "manifest-0000.jsonl"],
+                           model.cfg, segment_frames=60, seed=0)
+    loader = torch.utils.data.DataLoader(ds, batch_size=1, collate_fn=collate,
+                                         drop_last=True)
+    losses = eval_per_codebook(model, loader, n_batches=2, device="cpu",
+                               mcfg=model.cfg)
+    assert losses and all(np.isfinite(v) for v in losses.values())

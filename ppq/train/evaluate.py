@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 @torch.no_grad()
 def eval_per_codebook(model, loader, n_batches: int, device, mcfg: PPQModelConfig) -> dict:
     """Unweighted CE per stream on held-out samples."""
+    device = torch.device(device)  # accept both "cuda" and torch.device
     model.eval()
     sums: dict[str, float] = {}
     counts: dict[str, int] = {}
