@@ -74,6 +74,35 @@ def test_lmgen_cpu_smoke():
         assert n_out == 50
 
 
+def test_kv_frames_and_finish_system_prompts():
+    """PPQLMGen._kv_frames/_finish_system_prompts replace moshi's versions,
+    which hardcode `lm_model.transformer` + StreamingMultiheadAttention —
+    PPQLMModel has a Qwen3 backbone, so moshi's would raise AttributeError."""
+    model = tiny_model()
+    assert not hasattr(model, "transformer")  # the moshi assumption we break
+    lm_gen = PPQLMGen(model, device="cpu", check=True, use_sampling=False)
+    g = torch.Generator().manual_seed(3)
+    with lm_gen.streaming(1):
+        assert lm_gen._kv_frames() == 0
+        for _ in range(5):
+            lm_gen.step(torch.randint(0, 2048, (1, 8, 1), generator=g))
+        # The first step() call only primes the delay cache (prepare_step_input
+        # returns None, no backbone forward), so the KV offset trails the
+        # step() count by one — same as moshi's own _kv_frames would report.
+        frames = lm_gen._kv_frames()
+        assert frames == 4
+        attn = model.backbone.layers[0].self_attn
+        assert frames == int(attn._streaming_state.offset.item())
+        lm_gen._finish_system_prompts(frames)
+        assert lm_gen.system_prompt_frames == frames
+    # The pin path must not touch lm_model.transformer either: it degrades to
+    # unpinned with a warning instead of calling moshi's pin_kv_prefix.
+    lm_gen.pin_system_prompt = True
+    lm_gen._finish_system_prompts(7)
+    assert lm_gen.system_prompt_frames == 7
+    assert lm_gen.pin_system_prompt is False
+
+
 def test_streaming_matches_training():
     model = tiny_model()
     T = 40

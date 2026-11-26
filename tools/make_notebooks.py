@@ -555,7 +555,8 @@ TRAIN_CELLS.append(CLONE_CELL)
 TRAIN_CELLS.append(code("""
 import subprocess, sys
 subprocess.run([sys.executable, "-m", "pip", "install", "-q",
-    "huggingface_hub", "safetensors", "einops", "sphn", "peft"], check=True)
+    "huggingface_hub", "safetensors", "einops", "sphn", "peft",
+    "soundfile", "kokoro>=0.9", "misaki[en]", "pyloudnorm"], check=True)
 print("deps ok")
 """))
 
@@ -853,7 +854,19 @@ import sphn
 user_wav, sr = sphn.read(str(USER_WAV))
 if sr != 24000:
     user_wav = sphn.resample(user_wav, sr, 24000)
-vp_wav, vp_sr = sphn.read(str(DATA_ROOT / "voice_prompt_agent.wav"))
+
+VP_WAV = DATA_ROOT / "voice_prompt_agent.wav"
+if not VP_WAV.exists():
+    # The HF pipeline sources with voice_prompt=none (e.g. video-21h) never
+    # create an agent voice prompt - synthesize one so this cell works.
+    from ppq.data.tts_kokoro import KokoroTTS
+    import soundfile as sf
+    res = KokoroTTS().synth(
+        "Hi there! I'm your assistant. It's really great to meet you today.",
+        voice="af_heart")
+    sf.write(VP_WAV, res.wav, 24000)
+    print("synthesized fallback voice prompt:", VP_WAV)
+vp_wav, vp_sr = sphn.read(str(VP_WAV))
 if vp_sr != 24000:
     vp_wav = sphn.resample(vp_wav, vp_sr, 24000)
 
