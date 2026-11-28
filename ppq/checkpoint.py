@@ -81,9 +81,32 @@ def build_model_from_scratch(
         load_qwen_weights(model, qwen_dir)
     if depformer_source is not None:
         transplant_depformer(model, depformer_source)
+    rescale_fresh_embeddings(model)
     model = model.to(device=device)
     model.eval()
     return model
+
+
+def rescale_fresh_embeddings(model: PPQLMModel) -> None:
+    """Re-init the freshly trained embedding tables at a matched scale.
+
+    nn.Embedding initializes N(0, 1), but the backbone input is the SUM of 16
+    audio embeddings + the text embedding: N(0,1) audio rows give a summed
+    input of ~4 per dim while Qwen text embeddings are ~0.01-0.03, so the
+    audio stream drowns the text stream (~1% of input variance) and pushes
+    the pretrained backbone out of distribution. depformer_text_emb has the
+    same problem against the transplanted depformer_emb tables. Re-init so
+    the summed audio input and the text input start at comparable scale.
+    """
+    import math
+    with torch.no_grad():
+        text_std = model.text_emb.emb.weight.float().std().item()
+        audio_std = text_std / math.sqrt(model.cfg.n_q)
+        for emb in model.emb:
+            emb.weight.normal_(0.0, audio_std)
+        ref = torch.cat([e.weight.float().flatten() for e in model.depformer_emb])
+        dep_std = ref.std().item()
+        model.depformer_text_emb.weight.normal_(0.0, dep_std)
 
 
 def get_mimi(mimi_weight: str | Path, device: str | torch.device = "cpu"):

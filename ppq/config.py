@@ -166,6 +166,10 @@ class TrainConfig:
     # LoRA (0 = full fine-tune)
     lora_rank: int = 0
     lora_alpha: int = 256
+    lora_lr: float = 1e-4           # LoRA adapter LR (own group; adapters start at 0)
+    # Eval holdout: fraction of samples excluded from training (deterministic
+    # per-sample path hash; the eval cell scores only these).
+    holdout_fraction: float = 0.02
     # Distributed / numerics
     fsdp: bool = False
     gradient_checkpointing: bool = True

@@ -39,6 +39,24 @@ def random_codes(T: int, text_card: int = 512, card: int = 2048) -> torch.Tensor
     return codes
 
 
+def test_build_from_scratch_rescales_fresh_embeddings():
+    """The 16 fresh audio tables must be re-init so their SUM matches the text
+    embedding scale (nn.Embedding's N(0,1) default drowns the text stream
+    ~100-400x), and depformer_text_emb must match the depformer_emb scale."""
+    import math
+    from ppq.checkpoint import build_model_from_scratch
+    cfg = tiny_model().cfg
+    model = build_model_from_scratch(cfg)  # no qwen/depformer sources: all fresh
+    text_std = model.text_emb.emb.weight.float().std().item()
+    for emb in model.emb:
+        assert emb.weight.float().std().item() == pytest.approx(
+            text_std / math.sqrt(cfg.n_q), rel=0.05)
+    dep_ref = torch.cat([e.weight.float().flatten()
+                         for e in model.depformer_emb]).std().item()
+    assert model.depformer_text_emb.weight.float().std().item() == pytest.approx(
+        dep_ref, rel=0.05)
+
+
 def test_forward_train_shapes():
     model = tiny_model()
     codes = random_codes(40)

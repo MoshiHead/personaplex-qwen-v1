@@ -11,6 +11,7 @@ sample is shorter).
 from __future__ import annotations
 
 import bisect
+import hashlib
 import json
 import random
 from pathlib import Path
@@ -22,11 +23,22 @@ from torch.utils.data import Dataset
 from ..config import PPQModelConfig, SILENCE_TOKENS, SINE_TOKENS
 
 
+def _is_holdout(path: str, fraction: float) -> bool:
+    """Deterministic per-sample holdout assignment (stable across runs and
+    machines, so the training and eval processes agree without coordination)."""
+    h = int(hashlib.md5(str(path).encode("utf-8")).hexdigest()[:8], 16)
+    return (h % 1000) < fraction * 1000
+
+
 class TokenShardDataset(Dataset):
     def __init__(self, manifest_paths: list[str | Path], cfg: PPQModelConfig,
                  segment_frames: int = 1250, seed: int = 0,
                  epoch_multiplier: int = 20,
-                 source_weights: dict | None = None):
+                 source_weights: dict | None = None,
+                 holdout_fraction: float = 0.0, split: str = "all"):
+        """split: "all" (default), "train" (skip holdout samples) or "eval"
+        (keep ONLY holdout samples)."""
+        assert split in ("all", "train", "eval"), split
         self.cfg = cfg
         self.segment_frames = segment_frames
         self.entries: list[dict] = []
@@ -34,9 +46,16 @@ class TokenShardDataset(Dataset):
             with open(mp, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
-                    if line:
-                        self.entries.append(json.loads(line))
-        assert self.entries, f"empty manifest(s): {manifest_paths}"
+                    if not line:
+                        continue
+                    entry = json.loads(line)
+                    if holdout_fraction > 0.0 and split != "all":
+                        held = _is_holdout(entry["path"], holdout_fraction)
+                        if (split == "train" and held) or (split == "eval" and not held):
+                            continue
+                    self.entries.append(entry)
+        assert self.entries, (f"empty manifest(s): {manifest_paths} "
+                              f"(split={split}, holdout_fraction={holdout_fraction})")
         self.rng = random.Random(seed)
         # Logical epoch = several passes with different random crops.
         self.epoch_len = len(self.entries) * epoch_multiplier

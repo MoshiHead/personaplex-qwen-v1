@@ -121,12 +121,13 @@ def test_lora_grouping_and_merged_final(tmp_path):
                        backbone_lr_mult=0.5, depformer_lr_mult=1.5)
     lora_model = maybe_apply_lora(tiny_model(), tcfg)
     opt = make_optimizer(lora_model, tcfg)
-    g_backbone, g_dep, _ = opt.param_groups
+    g_lora, g_backbone, g_dep, _ = opt.param_groups
+    assert g_lora["lr"] == pytest.approx(tcfg.lora_lr)  # adapters need a real LR
     assert g_backbone["lr"] == pytest.approx(1e-4 * 0.5)
     assert g_dep["lr"] == pytest.approx(1e-4 * 1.5)
     lora_params = [p for n, p in lora_model.named_parameters() if "lora_" in n]
     assert lora_params, "peft did not add any LoRA params"
-    assert all(any(p is q for q in g_backbone["params"]) for p in lora_params)
+    assert all(any(p is q for q in g_lora["params"]) for p in lora_params)
     dep_trainable = [p for n, p in lora_model.named_parameters()
                      if p.requires_grad and ".depformer" in n and "lora_" not in n]
     assert dep_trainable

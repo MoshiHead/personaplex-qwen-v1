@@ -572,7 +572,7 @@ QWEN_BASE = "/workspace/models/qwen3-1.7b-base"        # local Qwen3-1.7B-Base s
 PERSONAPLEX_CKPT = "/workspace/models/personaplex/model.sft"  # personaplex LM (depformer donor)
 DATA_ROOT = Path("/workspace/ppq_data")
 TOKENS_DIR = DATA_ROOT / "tokens"
-RUN_DIR = Path("/workspace/ppq_runs/run2")  # run1 = video-21h trial; fresh dir = clean LR schedule
+RUN_DIR = Path("/workspace/ppq_runs/run3")  # run2 = bf16-update stall; run3 = AdamWSR + init-scale + LoRA-LR fixes
 N_GPUS = 2                   # training ranks; auto-clamped to the physical GPU count
 # --------------------
 
@@ -787,7 +787,7 @@ tcfg_b = TrainConfig(
                                  # Set BEFORE launch - the cosine LR schedule is
                                  # derived from max_steps, changing it mid-run rescales LR.
     lr=5e-6, backbone_lr_mult=0.5, depformer_lr_mult=1.5,
-    lora_rank=64,
+    lora_rank=64, lora_lr=1e-4,  # adapters start at 0 -> need a real LR, not 2.5e-6
     save_every=250, save_every_minutes=30, keep_last_k=3,
     log_every=10,
     fsdp=False,
@@ -813,7 +813,7 @@ generation against a recorded user utterance (or synthesized one).
 """))
 
 TRAIN_CELLS.append(code("""
-import glob, torch
+import glob, json, torch
 from ppq.checkpoint import load_pretrained
 from ppq.data.dataset import TokenShardDataset, collate
 from ppq.train.evaluate import eval_per_codebook
@@ -824,8 +824,12 @@ assert is_complete(FINAL_B), "finish Stage B first"
 device = "cuda"
 model = load_pretrained(FINAL_B, device=device)
 manifests = sorted(glob.glob(str(TOKENS_DIR / "manifest*.jsonl")))  # all sources + shards
-print(f"eval manifests: {len(manifests)}")
-ds = TokenShardDataset(manifests, model.cfg, segment_frames=1250, seed=999)
+# Held-out split only: samples excluded from training (deterministic path hash,
+# same fraction as the Stage B config) -> a true generalization measurement.
+holdout = json.loads((STAGE_B_DIR / "config.json").read_text()).get("holdout_fraction", 0.02)
+ds = TokenShardDataset(manifests, model.cfg, segment_frames=1250, seed=999,
+                       holdout_fraction=holdout, split="eval")
+print(f"eval manifests: {len(manifests)} | held-out eval entries: {len(ds.entries)}")
 loader = torch.utils.data.DataLoader(ds, batch_size=4, collate_fn=collate, drop_last=True)
 losses = eval_per_codebook(model, loader, n_batches=8, device=device, mcfg=model.cfg)
 print({k: round(v, 3) for k, v in losses.items()})

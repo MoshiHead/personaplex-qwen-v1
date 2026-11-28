@@ -111,3 +111,28 @@ def test_dataset_crop_and_pad(tmp_path):
     assert item["codes"].shape == (17, 150)
     assert (item["loss_mask"][:, 100:] == 0).all()
     assert item["codes"][0, 100] == cfg.text_pad_id
+
+
+def test_dataset_holdout_split(tmp_path):
+    """train/eval splits must be disjoint, cover every sample, and be
+    deterministic (same assignment across dataset constructions)."""
+    from ppq.data.dataset import TokenShardDataset
+    cfg = PPQModelConfig()
+    entries = [{"path": str(tmp_path / f"s{i}.npz"), "frames": 60} for i in range(200)]
+    manifest = tmp_path / "m.jsonl"
+    manifest.write_text("".join(json.dumps(e) + "\n" for e in entries))
+
+    train_ds = TokenShardDataset([manifest], cfg, holdout_fraction=0.1, split="train")
+    eval_ds = TokenShardDataset([manifest], cfg, holdout_fraction=0.1, split="eval")
+    train_paths = {e["path"] for e in train_ds.entries}
+    eval_paths = {e["path"] for e in eval_ds.entries}
+    assert train_paths.isdisjoint(eval_paths)
+    assert len(train_paths) + len(eval_paths) == 200
+    assert 0 < len(eval_paths) < 60  # ~10% of 200, with hash variance
+
+    again = TokenShardDataset([manifest], cfg, holdout_fraction=0.1, split="eval")
+    assert {e["path"] for e in again.entries} == eval_paths
+
+    # split="all" (default) keeps everything regardless of the fraction
+    all_ds = TokenShardDataset([manifest], cfg, holdout_fraction=0.1)
+    assert len(all_ds.entries) == 200

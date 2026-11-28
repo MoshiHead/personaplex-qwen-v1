@@ -94,19 +94,25 @@ def maybe_apply_lora(model, tcfg: TrainConfig):
 
 
 def make_optimizer(model, tcfg: TrainConfig):
-    groups = {"backbone": [], "depformer": [], "other": []}
+    from .optim import AdamWSR
+    groups = {"lora": [], "backbone": [], "depformer": [], "other": []}
     peft_prefix = "base_model.model."  # peft wraps every param name with this
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
         gname = name[len(peft_prefix):] if name.startswith(peft_prefix) else name
-        if gname.startswith(("backbone.", "text_emb.", "text_linear.")):
+        if "lora_" in name:
+            groups["lora"].append(p)
+        elif gname.startswith(("backbone.", "text_emb.", "text_linear.")):
             groups["backbone"].append(p)
         elif gname.startswith(("depformer", "linears.")):
             groups["depformer"].append(p)
         else:
             groups["other"].append(p)
-    return torch.optim.AdamW([
+    # AdamWSR: fp32 update math + stochastic-rounding bf16 write-back, so the
+    # small updates of these fine-tuning LRs are not rounded away (run2 stall).
+    return AdamWSR([
+        {"params": groups["lora"], "lr": tcfg.lora_lr},
         {"params": groups["backbone"], "lr": tcfg.lr * tcfg.backbone_lr_mult},
         {"params": groups["depformer"], "lr": tcfg.lr * tcfg.depformer_lr_mult},
         {"params": groups["other"], "lr": tcfg.lr},
@@ -254,7 +260,10 @@ def main(config_path: str | None = None):
     assert manifests, f"no manifests found in {tcfg.data_dir}"
     dataset = TokenShardDataset(manifests, tcfg.model, segment_frames=tcfg.segment_frames,
                                 seed=tcfg.seed + start_step + rank,
-                                source_weights=tcfg.source_weights or None)
+                                source_weights=tcfg.source_weights or None,
+                                holdout_fraction=tcfg.holdout_fraction, split="train")
+    logger.info("dataset: %d training entries (%.1f%% holdout excluded)",
+                len(dataset.entries), 100.0 * tcfg.holdout_fraction)
     if tcfg.source_weights:
         counts: dict[str, int] = {}
         for e in dataset.entries:
@@ -318,15 +327,20 @@ def main(config_path: str | None = None):
                                              map_location="cpu", weights_only=False))
         scheduler.load_state_dict(torch.load(ckpt_dir / "scheduler.pt",
                                              map_location="cpu", weights_only=False))
+
+    # --- loop ---
+    data_iter = iter(loader)
+    if resume_state is not None:
+        # Restore RNG states LAST: iter(loader) draws a base seed from the
+        # global torch RNG (and RandomSampler draws when shuffle=True), so
+        # restoring earlier would desync every per-step RNG consumer (e.g.
+        # AdamWSR's stochastic rounding) against a fresh uninterrupted run.
         torch.set_rng_state(resume_state["torch_rng"])
         random.setstate(resume_state["py_rng"])
         np.random.set_state(resume_state["np_rng"])
         if "cuda_rng" in resume_state and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(resume_state["cuda_rng"])
         logger.info("restored optimizer/scheduler/RNG states (step %d)", start_step)
-
-    # --- loop ---
-    data_iter = iter(loader)
     t0 = time.time()
     last_save_t = t0
     step_times: collections.deque = collections.deque(maxlen=200)
@@ -352,7 +366,7 @@ def main(config_path: str | None = None):
                 losses = compute_losses(lm_out, codes, mask, tcfg, raw_model.cfg)
                 loss = losses["total"] / tcfg.grad_accum
             loss.backward()
-            audio_seconds_seen += float(codes.shape[1]) * float(codes.shape[0]) / 12.5
+            audio_seconds_seen += float(codes.shape[2]) * float(codes.shape[0]) / 12.5
             for k, v in losses.items():
                 accum[k] = accum.get(k, 0.0) + float(v.detach()) / tcfg.grad_accum
         torch.nn.utils.clip_grad_norm_(
